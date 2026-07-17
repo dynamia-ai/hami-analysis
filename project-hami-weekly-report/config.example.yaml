@@ -1,0 +1,12 @@
+github:
+  org: Project-HAMi
+  token_env: GITHUB_TOKEN
+
+scan:
+  # 最近 7 个自然日，包括运行当天。
+  days: 7
+  # 固定使用 UTC+8，不接受其他时区。
+  timezone: Asia/Shanghai
+
+output:
+  file: ./output/github-activity-{org}-{start_date}-{end_date}.md

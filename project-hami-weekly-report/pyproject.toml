@@ -1,0 +1,31 @@
+[project]
+name = "hami-github-activity"
+version = "0.1.0"
+description = "Collect Project-HAMi GitHub activity into a stable Markdown evidence file."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "httpx>=0.28.1,<1",
+  "pydantic>=2.12.5,<3",
+  "pyyaml>=6.0.3,<7",
+  "typer>=0.21.0,<1",
+]
+
+[project.scripts]
+hami-github-activity = "hami_github_activity.cli:app"
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.2,<10",
+]
+
+[build-system]
+requires = ["hatchling>=1.28"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hami_github_activity"]

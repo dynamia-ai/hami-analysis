@@ -1,0 +1,4 @@
+interface:
+  display_name: "Weekly HAMi Org Highlights"
+  short_description: "从 GitHub evidence 生成 Dynamia 内部 HAMi 周报"
+  default_prompt: "使用 $weekly-hami-org-highlights 的有界读取器和分层上下文流程处理 evidence，生成 Weekly HAMi Org Highlights，并在交付前通过链接与列表格式校验。"
