@@ -182,7 +182,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 if not any(row.member_id == member.member_id and row.source == source and row.status in {"failed", "partial"} for row in statuses):
                     set_status(member.member_id, source, "complete", None, finished)
         else:
-            for source, _, _ in source_specs:
+            for source, _, _, _ in source_specs:
                 if not any(row.member_id == member.member_id and row.source == source and row.status in {"failed", "partial"} for row in statuses):
                     set_status(member.member_id, source, "complete", None, observed_at)
 
