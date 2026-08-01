@@ -74,12 +74,11 @@ def test_workflow_exit_matrix_is_executable():
 @pytest.mark.parametrize("collector_code", [0, 2, 3, 4])
 @pytest.mark.parametrize("artifact_ready", ["true", "false", ""])
 @pytest.mark.parametrize("upload_outcome", ["success", "failure", "skipped"])
-@pytest.mark.parametrize("period_kind", ["weekly", "monthly"])
-def test_final_gate_executes_all_frozen_72_combinations(collector_code, artifact_ready, upload_outcome, period_kind):
+def test_final_gate_executes_all_frozen_36_unique_combinations(collector_code, artifact_ready, upload_outcome):
     gate = Path(__file__).parents[1] / "scripts" / "final_gate.sh"
     result = subprocess.run(
         [str(gate)],
-        env={**os.environ, "COLLECT_EXIT_CODE": str(collector_code), "ARTIFACT_READY": artifact_ready, "UPLOAD_OUTCOME": upload_outcome, "PERIOD_KIND": period_kind},
+        env={**os.environ, "COLLECT_EXIT_CODE": str(collector_code), "ARTIFACT_READY": artifact_ready, "UPLOAD_OUTCOME": upload_outcome},
         check=False,
     )
     if collector_code in {0, 3}:
@@ -205,6 +204,49 @@ def test_committed_workflow_fixtures_execute_real_verify_receipt_path_and_fault_
             check=False,
         )
         assert failed_upload.returncode == 4
+
+
+@pytest.mark.parametrize("event_name,schedule,dispatch,expected_period", [
+    ("schedule", "15 1 * * 2", "", "weekly"),
+    ("schedule", "30 1 2 * *", "", "monthly"),
+])
+@pytest.mark.parametrize("mode,expected_ready,collector_code", [
+    ("published", "true", 0),
+    ("diagnostic_success", "true", 3),
+    ("safe_diagnostic", "true", 4),
+    ("collector_2", "false", 2),
+    ("verify_fail", "false", 3),
+    ("malformed_receipt", "false", 3),
+])
+@pytest.mark.parametrize("upload_outcome", ["success", "failure", "skipped"])
+def test_workflow_wrapper_to_final_gate_executes_36_event_upload_combinations(tmp_path, event_name, schedule, dispatch, expected_period, mode, expected_ready, collector_code, upload_outcome):
+    root = Path(__file__).parents[1]
+    fixtures = root / "tests" / "fixtures" / "workflow"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text((fixtures / "fake_uv.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (fake_bin / "uv").chmod(0o755)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    runner_temp = run_root / "runner-temp"
+    runner_temp.mkdir()
+    output = run_root / "github-output"
+    args_log = run_root / "args.log"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": str(root / "src"), "PYTHON_EXECUTABLE": sys.executable, "FIXTURE_BUILDER": str(fixtures / "build_fixture.py"), "FIXTURE_MODE": mode, "FIXTURE_ARGS_LOG": str(args_log), "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "WORKFLOW_EVENT_NAME": event_name, "WORKFLOW_SCHEDULE": schedule, "WORKFLOW_DISPATCH_PERIOD": dispatch}
+    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    values = _values(output)
+    assert values["artifact_ready"] == expected_ready
+    assert values["collector_exit_code"] == str(collector_code)
+    assert f"--period {expected_period}" in args_log.read_text(encoding="utf-8")
+    final = subprocess.run([str(root / "scripts" / "final_gate.sh")], env={**env, "COLLECT_EXIT_CODE": values["exit_code"], "ARTIFACT_READY": values["artifact_ready"], "UPLOAD_OUTCOME": upload_outcome}, check=False)
+    if collector_code == 2 and expected_ready == "false":
+        assert final.returncode == 2
+    elif values["artifact_ready"] == "true" and upload_outcome == "success" and collector_code in {0, 3}:
+        assert final.returncode == collector_code
+    else:
+        assert final.returncode == 4
 
 
 @pytest.mark.parametrize("event_name,schedule,dispatch,expected", [

@@ -132,20 +132,18 @@ def _write_receipt(run_dir: Path, *, mode: str) -> None:
 def build(mode: str) -> None:
     if mode == "collector_2":
         return
-    if mode in {"published", "wrong_path_valid", "status_swap"}:
+    if mode in {"published", "wrong_path_valid"}:
         run_dir = _published()
         if mode == "wrong_path_valid":
             bad = Path("diagnostics") / RUN_ID
             shutil.copytree(run_dir, bad)
             run_dir = bad
-        elif mode == "status_swap":
-            diagnostic = Path("diagnostics") / RUN_ID
-            diagnostic.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(run_dir, diagnostic)
-            swapped = Path("output") / PERIOD["id"] / RUN_ID
-            shutil.rmtree(swapped)
-            shutil.copytree(diagnostic, swapped)
-            run_dir = swapped
+    elif mode == "status_swap":
+        diagnostic = write_diagnostic(Path("diagnostics"), _diagnostic_manifest("no_applicable")).resolve()
+        swapped = Path("output") / PERIOD["id"] / RUN_ID
+        swapped.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(diagnostic, swapped)
+        run_dir = swapped
     else:
         kind = "no_applicable" if mode in {"diagnostic_success", "verify_fail", "malformed_receipt", "wrong_path", "receipt_pretty", "receipt_duplicate", "receipt_missing", "receipt_extra", "receipt_wrong_type", "receipt_wrong_hash", "receipt_wrong_period", "receipt_wrong_run", "receipt_wrong_slug", "receipt_absolute_path", "receipt_dotdot"} else "validation_failed" if mode == "validation_failed" else "run_aborted"
         run_dir = write_diagnostic(Path("diagnostics"), _diagnostic_manifest(kind)).resolve()
