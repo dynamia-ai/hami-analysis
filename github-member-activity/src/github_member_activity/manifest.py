@@ -64,7 +64,14 @@ def write_diagnostic(root: Path, manifest: dict[str, Any]) -> Path:
     if temp.exists():
         raise FileExistsError("output_conflict")
     temp.mkdir()
-    (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    try:
+        (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+        if {path.name for path in temp.iterdir()} != {"run-manifest.json"}:
+            raise ValueError("directory_shape_invalid")
+        verify_directory(temp)
+    except Exception:
+        shutil.rmtree(temp)
+        raise
     temp.replace(target)
     return target
 
@@ -233,6 +240,8 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
     _validate_status(status)
     if len(status["rows"]) != len(members) * 6:
         raise ValueError("source_status_invalid")
+    if {member.get("member_id") for member in members} != {row["member_id"] for row in status["rows"]}:
+        raise ValueError("source_status_invalid")
     if manifest.get("source_status_summary") != source_summary(status):
         raise ValueError("source_status_invalid")
     if manifest.get("safe_resolved_config_sha256") != digest_file(run_dir / "resolved-config.json"):
@@ -268,6 +277,10 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
             raise ValueError("ledger_invalid") from exc
     observed = parse_rfc3339(manifest["observed_at"])
     visibility = parse_rfc3339(manifest["publish_visibility_verified_at"])
+    for status_row in status["rows"]:
+        snapshot_at = status_row.get("snapshot_completed_at")
+        if snapshot_at is not None and not observed <= parse_rfc3339(snapshot_at) <= visibility:
+            raise ValueError("source_status_invalid")
     period_start = parse_rfc3339(manifest["period"]["start_utc"])
     period_end = parse_rfc3339(manifest["period"]["end_utc"])
     member_map = {member["member_id"]: member for member in members}

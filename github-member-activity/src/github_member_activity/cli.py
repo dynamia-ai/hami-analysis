@@ -119,6 +119,10 @@ def collect_command(
     else:
         try:
             token = token_for(value)
+        except ValueError as exc:
+            typer.echo("Error: configured token is unavailable", err=True)
+            raise typer.Exit(2) from exc
+        try:
             with GitHubClient(token, api_version=value.github.api_version) as client:
                 result = collect(value, report_period, client, observed_at=observed)
             statuses = result.statuses
@@ -153,9 +157,15 @@ def collect_command(
                     _write_receipt(receipt_path, report_period, rid, path)
                 typer.echo(f"published: {path}")
                 return
-        except ValueError as exc:
-            typer.echo("Error: configured token is unavailable", err=True)
-            raise typer.Exit(2) from exc
+        except FileExistsError:
+            reason = "output_conflict"
+            statuses = empty_statuses(value, report_period, observed_at=observed)
+        except OSError:
+            reason = "artifact_write_failed"
+            statuses = empty_statuses(value, report_period, observed_at=observed)
+        except ValueError:
+            reason = "validation_failed"
+            statuses = empty_statuses(value, report_period, observed_at=observed)
         except Exception:
             reason = "run_aborted"
             statuses = empty_statuses(value, report_period, observed_at=observed)

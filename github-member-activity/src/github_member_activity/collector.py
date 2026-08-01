@@ -26,7 +26,25 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
     groups = client.graphql(COMMIT_GROUPS_QUERY, variables).get("user", {}).get("contributionsCollection", {}).get("commitContributionsByRepository")
     if not isinstance(groups, list) or len(groups) > 100:
         raise RuntimeError("commit_context_unavailable")
-    if len(groups) == 100:
+    repo_ids: set[str] = set()
+    needs_partition = len(groups) == 100
+    for group in groups:
+        repo = group.get("repository") if isinstance(group, dict) else None
+        connection = group.get("contributions") if isinstance(group, dict) else None
+        if not isinstance(repo, dict) or not isinstance(repo.get("id"), str) or not repo["id"] or repo["id"] in repo_ids:
+            raise RuntimeError("api_contract_violation")
+        repo_ids.add(repo["id"])
+        if not isinstance(connection, dict) or not isinstance(connection.get("pageInfo"), dict):
+            raise RuntimeError("api_contract_violation")
+        page_info = connection["pageInfo"]
+        if not isinstance(page_info.get("hasNextPage"), bool):
+            raise RuntimeError("api_contract_violation")
+        # The contribution connection belongs to each outer repository group,
+        # but GraphQL does not expose a cursor that can be supplied separately
+        # for every group in one query.  Repartition the whole time range until
+        # every group is terminal; never silently accept a truncated group.
+        needs_partition = needs_partition or page_info["hasNextPage"]
+    if needs_partition:
         if end - start <= timedelta(days=1):
             raise RuntimeError("commit_context_unavailable")
         midpoint = start + timedelta(seconds=int((end - start).total_seconds() // 2))
@@ -45,13 +63,11 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
         connection = group.get("contributions") if isinstance(group, dict) else None
         if not isinstance(repo, dict) or not isinstance(connection, dict) or not isinstance(connection.get("totalCount"), int) or not isinstance(connection.get("edges"), list) or not isinstance(connection.get("pageInfo"), dict):
             raise RuntimeError("api_contract_violation")
-        if connection["totalCount"] != len(connection["edges"]) or connection["pageInfo"].get("hasNextPage"):
+        if connection["totalCount"] != len(connection["edges"]) or connection["pageInfo"].get("hasNextPage") is not False:
             raise RuntimeError("commit_context_unavailable")
         metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
         if metadata.visibility != "PUBLIC":
             raise RuntimeError("visibility_unverified")
-        if not public_and_allowed(metadata, policy):
-            continue
         for edge in connection["edges"]:
             node = edge.get("node") if isinstance(edge, dict) else None
             user = node.get("user") if isinstance(node, dict) else None
@@ -91,11 +107,25 @@ ISSUE_COMMENTS_QUERY = """
 query($login:String!, $after:String) {
   user(login:$login) {
     issueComments(first:100, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
-      totalCount edges { cursor node { __typename id author { __typename id } createdAt pullRequest { id } issue { id number } repository { id nameWithOwner visibility owner { id login } } } }
+      totalCount edges { cursor node { __typename id author { __typename id } createdAt updatedAt pullRequest { id } issue { id } repository { id visibility owner { id } } } }
       pageInfo { hasNextPage endCursor }
     }
   }
 }
+"""
+
+ISSUE_COMMENT_DISCOVERY_QUERY = """
+query($ids:[ID!]!) { nodes(ids:$ids) {
+  __typename id
+  ... on IssueComment { author { __typename id } createdAt updatedAt pullRequest { id } issue { id } repository { id visibility owner { id } } }
+} }
+"""
+
+ISSUE_COMMENT_HYDRATION_QUERY = """
+query($ids:[ID!]!) { nodes(ids:$ids) {
+  __typename id
+  ... on Issue { number repository { id nameWithOwner visibility owner { id login } } }
+} }
 """
 
 REVIEW_CONTRIBUTIONS_QUERY = """
@@ -109,6 +139,12 @@ query($login:String!, $from:DateTime!, $to:DateTime!, $after:String) {
     }
   }
 }
+"""
+
+REVIEW_PR_DISCOVERY_QUERY = """
+query($ids:[ID!]!) { nodes(ids:$ids) {
+  __typename id repository { id visibility owner { id } }
+} }
 """
 
 REVIEWS_QUERY = """
@@ -161,8 +197,11 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
     policy = config.repository_policy
     applied_owners: set[str] = set()
     applied_repos: set[str] = set()
+    allowed_reasons = {"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed", "stability_gap_not_met", "run_aborted", "search_capped", "search_incomplete_results", "search_cardinality_mismatch", "search_snapshot_unstable", "search_candidate_conflict", "graphql_partial_response", "graphql_snapshot_unstable", "graphql_cardinality_mismatch", "pagination_incomplete", "cursor_invalid", "rate_limited", "transport_retry_exhausted", "api_contract_violation", "visibility_unverified", "repository_binding_changed", "commit_context_unavailable", "commit_period_not_day_aligned", "member_window_empty"}
 
     def set_status(member_id: str, source: str, status: str, reason: str | None, finished: datetime | None = None) -> None:
+        if reason is not None and reason not in allowed_reasons:
+            reason = "api_contract_violation"
         for index, row in enumerate(statuses):
             if row.member_id == member_id and row.source == source:
                 complete = status == "complete"
@@ -259,12 +298,6 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 if metadata.visibility != "PUBLIC":
                     set_status(member.member_id, source, "failed", "visibility_unverified")
                     continue
-                if not public_and_allowed(metadata, policy):
-                    if metadata.owner_node_id in policy.excluded_owner_ids:
-                        applied_owners.add(metadata.owner_node_id)
-                    if metadata.node_id in policy.excluded_repo_ids:
-                        applied_repos.add(metadata.node_id)
-                    continue
                 raw_time = node.get(time_field)
                 if not isinstance(raw_time, str):
                     set_status(member.member_id, source, "failed", "api_contract_violation")
@@ -274,7 +307,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 except ValueError:
                     set_status(member.member_id, source, "failed", "api_contract_violation")
                     continue
-                if kind != "pr_merged" and raw_time != candidate.created_at:
+                try:
+                    parse_rfc3339(candidate.created_at)
+                except ValueError:
+                    set_status(member.member_id, source, "failed", "search_candidate_conflict")
+                    continue
+                if node.get("createdAt") != candidate.created_at:
                     set_status(member.member_id, source, "failed", "search_candidate_conflict")
                     continue
                 if not (start.astimezone(UTC) <= occurred < end.astimezone(UTC)):
@@ -312,17 +350,38 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     created = row.get("createdAt")
                     if not isinstance(created, str) or not (start.astimezone(UTC) <= parse_rfc3339(created) < end.astimezone(UTC)):
                         continue
+                    eligible.append({"id": row["id"], "issue_id": issue.get("id"), "created": created})
+                comment_ids = list(dict.fromkeys(item["id"] for item in eligible))
+                discovered_data = client.graphql(ISSUE_COMMENT_DISCOVERY_QUERY, {"ids": comment_ids}) if comment_ids else {"nodes": []}
+                discovered = discovered_data.get("nodes") if isinstance(discovered_data, dict) else None
+                if not isinstance(discovered, list) or len(discovered) != len(comment_ids):
+                    raise RuntimeError("visibility_unverified")
+                discovered_by_id = {node.get("id"): node for node in discovered if isinstance(node, dict)}
+                if set(discovered_by_id) != set(comment_ids) or len(discovered_by_id) != len(comment_ids):
+                    raise RuntimeError("visibility_unverified")
+                issue_ids = list(dict.fromkeys(item["issue_id"] for item in eligible))
+                hydrated_data = client.graphql(ISSUE_COMMENT_HYDRATION_QUERY, {"ids": issue_ids}) if issue_ids else {"nodes": []}
+                hydrated = hydrated_data.get("nodes") if isinstance(hydrated_data, dict) else None
+                if not isinstance(hydrated, list) or len(hydrated) != len(issue_ids):
+                    raise RuntimeError("visibility_unverified")
+                issue_by_id = {node.get("id"): node for node in hydrated if isinstance(node, dict)}
+                if set(issue_by_id) != set(issue_ids) or len(issue_by_id) != len(issue_ids):
+                    raise RuntimeError("visibility_unverified")
+                final_rows: list[dict[str, Any]] = []
+                for item in eligible:
+                    comment = discovered_by_id.get(item["id"])
+                    issue_node = issue_by_id.get(item["issue_id"])
+                    comment_issue = comment.get("issue") if isinstance(comment, dict) else None
+                    comment_repo = comment.get("repository") if isinstance(comment, dict) else None
+                    repo = issue_node.get("repository") if isinstance(issue_node, dict) else None
+                    if not isinstance(comment, dict) or comment.get("__typename") != "IssueComment" or not isinstance(comment.get("author"), dict) or comment["author"].get("__typename") != "User" or comment["author"].get("id") != member.github_node_id or comment.get("createdAt") != item["created"] or not isinstance(comment.get("updatedAt"), str) or comment.get("pullRequest") is not None or not isinstance(comment_issue, dict) or comment_issue.get("id") != item["issue_id"] or not isinstance(comment_repo, dict) or comment_repo.get("visibility") != "PUBLIC" or not isinstance(comment_repo.get("id"), str) or not isinstance((comment_repo.get("owner") or {}).get("id"), str) or not isinstance(issue_node, dict) or issue_node.get("__typename") != "Issue" or not isinstance(issue_node.get("number"), int) or not isinstance(repo, dict):
+                        raise RuntimeError("api_contract_violation")
                     metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
-                    if metadata.visibility != "PUBLIC":
+                    if metadata.visibility != "PUBLIC" or comment_repo.get("id") != metadata.node_id or comment_repo.get("visibility") != metadata.visibility or comment_repo.get("owner", {}).get("id") != metadata.owner_node_id:
                         raise RuntimeError("visibility_unverified")
-                    if not public_and_allowed(metadata, policy):
-                        if metadata.owner_node_id in policy.excluded_owner_ids:
-                            applied_owners.add(metadata.owner_node_id)
-                        if metadata.node_id in policy.excluded_repo_ids:
-                            applied_repos.add(metadata.node_id)
-                        continue
-                    eligible.append({"id": row["id"], "issue_id": issue.get("id"), "issue_number": issue.get("number"), "created": created, "repo": metadata})
-                digest = tuple(sorted((str(item["id"]), str(item["issue_id"]), item["created"]) for item in eligible))
+                    final_rows.append({**item, "issue_number": issue_node["number"], "repo": metadata})
+                eligible = final_rows
+                digest = tuple(sorted((str(item["id"]), str(item["issue_id"]), item["created"], item["repo"].node_id, item["repo"].full_name, item["repo"].owner_node_id) for item in eligible))
                 snapshots.append(digest)
                 snapshot_rows = eligible
             if snapshots[0] != snapshots[1]:
@@ -342,6 +401,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         try:
             review_snapshots: list[tuple[tuple[str, str, str], ...]] = []
             representative_rows: list[tuple[str, dict[str, Any]]] = []
+            review_discovery: dict[str, tuple[str, str]] = {}
             variables = {"login": member.github_login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
             for _ in range(2):
                 contributions = client.connection(REVIEW_CONTRIBUTIONS_QUERY, variables, ("user", "contributionsCollection", "pullRequestReviewContributions"))
@@ -356,6 +416,19 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if not isinstance(contributor, dict) or contributor.get("__typename") != "User" or contributor.get("id") != member.github_node_id or not isinstance(pull_request, dict) or not isinstance(pull_request.get("id"), str):
                         raise RuntimeError("api_contract_violation")
                     pr_ids.add(pull_request["id"])
+                discovery_data = client.graphql(REVIEW_PR_DISCOVERY_QUERY, {"ids": sorted(pr_ids)}) if pr_ids else {"nodes": []}
+                discovered = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
+                if not isinstance(discovered, list) or len(discovered) != len(pr_ids):
+                    raise RuntimeError("visibility_unverified")
+                discovered_by_id = {node.get("id"): node for node in discovered if isinstance(node, dict)}
+                if set(discovered_by_id) != pr_ids or len(discovered_by_id) != len(pr_ids):
+                    raise RuntimeError("visibility_unverified")
+                for pr_id in sorted(pr_ids):
+                    node = discovered_by_id[pr_id]
+                    repo = node.get("repository") if isinstance(node, dict) else None
+                    if node.get("__typename") != "PullRequest" or not isinstance(repo, dict) or repo.get("visibility") != "PUBLIC" or not isinstance(repo.get("id"), str) or not isinstance((repo.get("owner") or {}).get("id"), str):
+                        raise RuntimeError("visibility_unverified")
+                    review_discovery[pr_id] = (repo["id"], repo["owner"]["id"])
                 reps: list[tuple[str, dict[str, Any]]] = []
                 for pr_id in sorted(pr_ids):
                     reviews = client.connection(REVIEWS_QUERY, {"id": pr_id}, ("node", "reviews"))
@@ -392,13 +465,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if not isinstance(node, dict) or node.get("__typename") != "PullRequest" or not isinstance(repo, dict):
                         raise RuntimeError("visibility_unverified")
                     metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
-                    if metadata.visibility != "PUBLIC":
+                    if metadata.visibility != "PUBLIC" or review_discovery.get(pr_id) != (metadata.node_id, metadata.owner_node_id):
                         raise RuntimeError("visibility_unverified")
-                    if not public_and_allowed(metadata, policy) or not isinstance(node.get("number"), int):
-                        if metadata.owner_node_id in policy.excluded_owner_ids:
-                            applied_owners.add(metadata.owner_node_id)
-                        if metadata.node_id in policy.excluded_repo_ids:
-                            applied_repos.add(metadata.node_id)
+                    if not isinstance(node.get("number"), int):
                         continue
                     events.append(LedgerEvent(member.member_id, member.github_node_id, "pr_reviewed", str(review["id"]), pr_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), format_z(parse_rfc3339(review["submitted"])), None, 1, format_z(finished), format_z(finished), "root", f"https://github.com/{metadata.full_name}/pull/{node['number']}"))
                 set_status(member.member_id, "prs_reviewed", "complete", None, finished)
@@ -453,22 +522,35 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             response = client.graphql(gate_discovery_query, {"ids": sorted({event.subject_node_id for event in events})})
             discovery_nodes = response.get("nodes") if isinstance(response, dict) else None
             discovery = {node.get("id"): node for node in discovery_nodes if isinstance(node, dict)} if isinstance(discovery_nodes, list) else {}
-            if len(discovery) != len({event.subject_node_id for event in events}):
+            subject_ids = {event.subject_node_id for event in events}
+            if not isinstance(discovery_nodes, list) or len(discovery_nodes) != len(subject_ids) or len(discovery) != len(subject_ids):
                 raise RuntimeError("visibility_unverified")
             for event in events:
                 node = discovery.get(event.subject_node_id)
                 repo = node.get("repository") if isinstance(node, dict) else node
-                if not isinstance(node, dict) or node.get("id") != event.subject_node_id or not isinstance(repo, dict) or repo.get("id") != event.repo_node_id or repo.get("visibility") != "PUBLIC" or (repo.get("owner") or {}).get("id") != event.owner_node_id:
+                expected_type = "Repository" if event.event_kind == "commit_day" else "Issue" if event.event_kind in {"issue_opened", "issue_replied"} else "PullRequest"
+                if not isinstance(node, dict) or node.get("id") != event.subject_node_id or node.get("__typename") != expected_type or not isinstance(repo, dict) or repo.get("id") != event.repo_node_id or repo.get("visibility") != "PUBLIC" or (repo.get("owner") or {}).get("id") != event.owner_node_id:
                     raise RuntimeError("repository_binding_changed")
             response = client.graphql(gate_hydration_query, {"ids": sorted({event.subject_node_id for event in events})})
             hydration_nodes = response.get("nodes") if isinstance(response, dict) else None
             hydration = {node.get("id"): node for node in hydration_nodes if isinstance(node, dict)} if isinstance(hydration_nodes, list) else {}
+            if not isinstance(hydration_nodes, list) or len(hydration_nodes) != len(subject_ids) or len(hydration) != len(subject_ids):
+                raise RuntimeError("visibility_unverified")
             for event in events:
                 node = hydration.get(event.subject_node_id)
                 repo = node if isinstance(node, dict) and node.get("__typename") == "Repository" else (node.get("repository") if isinstance(node, dict) else None)
-                if not isinstance(node, dict) or not isinstance(repo, dict) or repo.get("id") != event.repo_node_id or repo.get("visibility") != "PUBLIC" or repo.get("nameWithOwner") != event.repo_full_name or (repo.get("owner") or {}).get("id") != event.owner_node_id or not public_and_allowed(RepositoryMetadata(event.repo_node_id, event.repo_full_name, event.owner_node_id, event.owner_login, "PUBLIC"), policy):
+                if not isinstance(node, dict) or not isinstance(repo, dict) or repo.get("id") != event.repo_node_id or repo.get("visibility") != "PUBLIC" or repo.get("nameWithOwner") != event.repo_full_name or (repo.get("owner") or {}).get("id") != event.owner_node_id:
                     raise RuntimeError("repository_binding_changed")
-            events = [replace(event, visibility_verified_at=format_z(gate_at)) for event in events]
+            verified_events: list[LedgerEvent] = []
+            for event in events:
+                if public_and_allowed(RepositoryMetadata(event.repo_node_id, event.repo_full_name, event.owner_node_id, event.owner_login, "PUBLIC"), policy):
+                    verified_events.append(replace(event, visibility_verified_at=format_z(gate_at)))
+                else:
+                    if event.owner_node_id in policy.excluded_owner_ids:
+                        applied_owners.add(event.owner_node_id)
+                    if event.repo_node_id in policy.excluded_repo_ids:
+                        applied_repos.add(event.repo_node_id)
+            events = verified_events
         except Exception as exc:
             reason = getattr(exc, "args", ["visibility_unverified"])[0]
             for row in list(statuses):

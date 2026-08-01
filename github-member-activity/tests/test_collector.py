@@ -1,7 +1,9 @@
 from datetime import UTC, datetime, date
 
-from github_member_activity.collector import collect
-from github_member_activity.config import AppConfig
+import pytest
+
+from github_member_activity.collector import _commit_snapshot, collect
+from github_member_activity.config import AppConfig, RepositoryPolicyConfig
 from github_member_activity.github_client import SearchPage
 from github_member_activity.period import build_period
 
@@ -17,6 +19,34 @@ class EmptyGitHub:
 
     def connection(self, query, variables, path):
         return []
+
+
+class CommitPartitionGitHub:
+    def __init__(self, *, always_next=False):
+        self.calls = []
+        self.always_next = always_next
+
+    def graphql(self, query, variables):
+        self.calls.append(variables)
+        day = variables["from"][:10]
+        has_next = self.always_next or (day == "2026-01-01" and variables["to"][:10] == "2026-01-03")
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
+            "repository": {"id": "R1", "nameWithOwner": "dynamia-ai/demo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "dynamia-ai"}},
+            "contributions": {"totalCount": 1, "edges": [{"cursor": "c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"{day}T12:00:00Z", "commitCount": 2, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}}], "pageInfo": {"hasNextPage": has_next, "endCursor": "c1"}},
+        }]}}}
+
+
+def test_commit_inner_connection_is_repartitioned_instead_of_truncated():
+    client = CommitPartitionGitHub()
+    rows = _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC), RepositoryPolicyConfig())
+    assert [(row["repo"].node_id, row["day"]) for row in rows] == [("R1", "2026-01-01"), ("R1", "2026-01-02")]
+    assert len(client.calls) == 3
+
+
+def test_commit_inner_connection_at_one_day_is_unavailable():
+    client = CommitPartitionGitHub(always_next=True)
+    with pytest.raises(RuntimeError, match="commit_context_unavailable"):
+        _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
 
 
 def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
