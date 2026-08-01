@@ -129,9 +129,11 @@ def test_receipt_failure_stops_before_diagnostic_without_recursive_compensation(
 def test_workflow_run_blocks_are_shell_parseable():
     workflow = Path(__file__).parents[2] / ".github" / "workflows" / "github-member-activity.yml"
     text = workflow.read_text(encoding="utf-8")
-    assert "uv run github-member-activity collect" in text
-    assert "github-member-activity-receipt.json" in text
-    assert "case \"$code\" in 0|2|3|4" in text
+    wrapper = workflow.parents[2] / "github-member-activity" / "scripts" / "workflow_wrapper.sh"
+    wrapper_text = wrapper.read_text(encoding="utf-8")
+    assert "uv run github-member-activity collect" in wrapper_text
+    assert "github-member-activity-receipt.json" in wrapper_text
+    assert "scripts/final_gate.sh" in text
     blocks = []
     current = []
     in_block = False
@@ -151,3 +153,8 @@ def test_workflow_run_blocks_are_shell_parseable():
     for block in blocks:
         completed = subprocess.run(["bash", "-n"], input=block, text=True, capture_output=True)
         assert completed.returncode == 0, completed.stderr
+    completed = subprocess.run(["bash", "-n", str(wrapper)], text=True, capture_output=True)
+    assert completed.returncode == 0, completed.stderr
+    final_gate = wrapper.parent / "final_gate.sh"
+    completed = subprocess.run(["bash", "-n", str(final_gate)], text=True, capture_output=True)
+    assert completed.returncode == 0, completed.stderr

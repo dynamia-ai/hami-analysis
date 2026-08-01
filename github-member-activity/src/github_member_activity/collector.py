@@ -13,6 +13,20 @@ from .search import stable_search
 from .repository_policy import RepositoryMetadata, public_and_allowed
 
 
+_FAILED_REASONS = frozenset({
+    "identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch",
+    "authentication_failed", "search_candidate_conflict", "graphql_cardinality_mismatch", "cursor_invalid",
+    "api_contract_violation", "visibility_unverified", "repository_binding_changed",
+})
+_PARTIAL_REASONS = frozenset({
+    "search_capped", "search_incomplete_results", "search_cardinality_mismatch", "search_snapshot_unstable",
+    "graphql_partial_response", "graphql_snapshot_unstable", "pagination_incomplete", "rate_limited",
+    "transport_retry_exhausted", "commit_context_unavailable",
+})
+_NOT_APPLICABLE_REASONS = frozenset({"member_window_empty", "commit_period_not_day_aligned"})
+_NOT_RUN_REASONS = frozenset({"stability_gap_not_met", "run_aborted"})
+
+
 @dataclass(slots=True)
 class CollectionResult:
     events: list[LedgerEvent]
@@ -345,6 +359,14 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
     def set_status(member_id: str, source: str, status: str, reason: str | None, finished: datetime | None = None) -> None:
         if reason is not None and reason not in allowed_reasons:
             reason = "api_contract_violation"
+        if reason in _FAILED_REASONS:
+            status = "failed"
+        elif reason in _PARTIAL_REASONS:
+            status = "partial"
+        elif reason in _NOT_APPLICABLE_REASONS:
+            status = "not_applicable"
+        elif reason in _NOT_RUN_REASONS:
+            status = "not_run"
         for index, row in enumerate(statuses):
             if row.member_id == member_id and row.source == source:
                 complete = status == "complete"

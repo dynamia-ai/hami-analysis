@@ -1,8 +1,9 @@
 import pytest
 
 from github_member_activity.github_client import GitHubClient, GitHubRequestError
-from github_member_activity.manifest import _validate_diagnostic_state, _validate_status, write_diagnostic
+from github_member_activity.manifest import _validate_diagnostic_state, _validate_published_source_status, _validate_status, write_diagnostic
 from github_member_activity.models import LedgerEvent, SourceStatus
+from github_member_activity.period import build_period
 
 
 def _statuses(*, failed_source: str | None = None, failed_reason: str | None = None):
@@ -84,6 +85,30 @@ def test_commit_partial_reason_is_canonical_and_member_window_is_six_source_cons
     stale_snapshot["rows"][0]["snapshot_completed_at"] = "2026-01-01T00:00:00Z"
     with pytest.raises(ValueError, match="diagnostic_state_invalid"):
         _validate_diagnostic_state({"observed_at": "2026-01-02T00:00:00Z", "run_reason": "core_source_incomplete", "diagnostic_source_status": stale_snapshot})
+
+
+@pytest.mark.parametrize(
+    ("snapshot_complete", "snapshot_completed_at"),
+    [(None, "2026-01-02T00:00:00Z"), (False, "2026-01-02T00:00:00Z"), (True, None)],
+)
+def test_snapshot_completion_timestamp_is_bidirectionally_bound(snapshot_complete, snapshot_completed_at):
+    status = _statuses(failed_source="prs_opened", failed_reason="search_capped")
+    status["rows"][0].update({"snapshot_complete": snapshot_complete, "snapshot_completed_at": snapshot_completed_at})
+    with pytest.raises(ValueError, match="source_status_invalid"):
+        _validate_status(status)
+
+
+def test_published_optional_commit_status_is_six_row_identity_bound():
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-02T00:00:00Z")
+    members = [{"member_id": "alice", "active_from": "2020-01-01", "active_until": None}]
+    status = _statuses()
+    commit = status["rows"][-1]
+    commit.update({"status": "failed", "reason": "identity_node_mismatch", "pagination_complete": None, "partition_complete": None, "snapshot_complete": None, "visibility_complete": None, "snapshot_completed_at": None})
+    with pytest.raises(ValueError, match="source_status_invalid"):
+        _validate_published_source_status(status, members, period)
+
+    commit.update({"status": "partial", "reason": "commit_context_unavailable"})
+    _validate_published_source_status(status, members, period)
 
 
 def test_ledger_model_rejects_ordinary_quantity_and_wrong_partition():

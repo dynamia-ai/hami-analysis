@@ -422,6 +422,8 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["status"] == "complete" and row["reason"] is not None:
             raise ValueError("source_status_invalid")
+        if (row["snapshot_complete"] is True) != (row["snapshot_completed_at"] is not None):
+            raise ValueError("source_status_invalid")
         if row["snapshot_complete"] is True and not isinstance(row["snapshot_completed_at"], str):
             raise ValueError("source_status_invalid")
         if row["snapshot_complete"] is True:
@@ -460,6 +462,37 @@ def _validate_status(value: dict[str, Any]) -> None:
     members = {member for member, _ in seen}
     if len(seen) != len(members) * 6:
         raise ValueError("source_status_invalid")
+
+
+def _validate_published_source_status(status: dict[str, Any], members: list[dict[str, Any]], period: ReportPeriod) -> set[str]:
+    rows_by_member = {member["member_id"]: {row["source"]: row for row in status["rows"] if row["member_id"] == member["member_id"]} for member in members}
+    applicable_ids: set[str] = set()
+    for member in members:
+        member_rows = rows_by_member[member["member_id"]]
+        window = effective_window(period, date.fromisoformat(member["active_from"]), date.fromisoformat(member["active_until"]) if member["active_until"] else None)
+        if window is None:
+            if any(row["status"] != "not_applicable" or row["reason"] != "member_window_empty" for row in member_rows.values()):
+                raise ValueError("source_status_invalid")
+            continue
+        applicable_ids.add(member["member_id"])
+        if any(member_rows[source]["status"] != "complete" for source in SOURCE_ORDER[:-1]):
+            raise ValueError("core_source_incomplete")
+        identity_reasons = {row["reason"] for row in member_rows.values() if row["reason"] in IDENTITY_REASONS}
+        if identity_reasons:
+            identity_reason = next(iter(identity_reasons))
+            if len(identity_reasons) != 1 or any(row["status"] != "failed" or row["reason"] != identity_reason for row in member_rows.values()):
+                raise ValueError("source_status_invalid")
+        commit_row = member_rows["commit_context"]
+        if any(value.hour or value.minute or value.second for value in window):
+            if commit_row["status"] != "not_applicable" or commit_row["reason"] != "commit_period_not_day_aligned":
+                raise ValueError("source_status_invalid")
+        elif commit_row["status"] == "not_applicable":
+            raise ValueError("source_status_invalid")
+        elif commit_row["status"] == "partial" and commit_row["reason"] == "commit_context_unavailable":
+            pass
+        elif commit_row["status"] != "complete":
+            raise ValueError("source_status_invalid")
+    return applicable_ids
 
 
 def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
@@ -510,26 +543,7 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
     local_start = datetime.fromisoformat(manifest["period"]["start_local"])
     local_end = datetime.fromisoformat(manifest["period"]["end_local"])
     period_value = ReportPeriod(manifest["period"]["id"].split("-", 1)[0], manifest["period"]["timezone"], local_start, local_end)
-    rows_by_member = {member_id: {row["source"]: row for row in status["rows"] if row["member_id"] == member_id} for member_id in member_ids}
-    applicable_ids: set[str] = set()
-    for member in members:
-        member_rows = rows_by_member[member["member_id"]]
-        window = effective_window(period_value, date.fromisoformat(member["active_from"]), date.fromisoformat(member["active_until"]) if member["active_until"] else None)
-        if window is None:
-            if any(row["status"] != "not_applicable" or row["reason"] != "member_window_empty" for row in member_rows.values()):
-                raise ValueError("source_status_invalid")
-            continue
-        applicable_ids.add(member["member_id"])
-        if any(member_rows[source]["status"] != "complete" for source in SOURCE_ORDER[:-1]):
-            raise ValueError("core_source_incomplete")
-        commit_row = member_rows["commit_context"]
-        if any(value.hour or value.minute or value.second for value in window):
-            if commit_row["status"] != "not_applicable" or commit_row["reason"] != "commit_period_not_day_aligned":
-                raise ValueError("source_status_invalid")
-        elif commit_row["status"] == "not_applicable":
-            raise ValueError("source_status_invalid")
-        elif commit_row["status"] not in {"complete", "partial", "failed"}:
-            raise ValueError("source_status_invalid")
+    applicable_ids = _validate_published_source_status(status, members, period_value)
     if manifest.get("source_status_summary") != source_summary(status):
         raise ValueError("source_status_invalid")
     if manifest["source_status_summary"].get("core_complete") is not True:
