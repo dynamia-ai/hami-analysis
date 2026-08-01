@@ -259,7 +259,12 @@ def collect_command(
         diagnostics = _safe_output_root(config, "diagnostics")
         path = write_diagnostic(diagnostics, manifest)
     except Exception as exc:
-        typer.echo("Error: diagnostic artifact write failed", err=True)
+        detail = str(exc).strip() or type(exc).__name__
+        typer.echo(
+            f"Error: diagnostic artifact write failed: {type(exc).__name__}: {detail}; "
+            f"run_reason={reason}; failure={canonical_json(summary)}",
+            err=True,
+        )
         raise typer.Exit(4) from exc
     if receipt_path:
         try:

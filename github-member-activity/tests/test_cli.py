@@ -139,6 +139,31 @@ def test_build_oserror_is_artifact_write_failure_and_writes_diagnostic(tmp_path,
     assert '"run_reason":"artifact_write_failed"' in (diagnostic[0] / "run-manifest.json").read_text(encoding="utf-8")
 
 
+def test_diagnostic_write_failure_exposes_safe_reason_and_source_summary(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("PUBLIC_GITHUB_TOKEN", "test-token")
+
+    class NoopClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(cli_module, "GitHubClient", NoopClient)
+    monkeypatch.setattr(cli_module, "collect", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("rate_limited")))
+    monkeypatch.setattr(cli_module, "write_diagnostic", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("diagnostic_state_invalid")))
+    result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly"])
+    assert result.exit_code == 4
+    assert "diagnostic artifact write failed: ValueError: diagnostic_state_invalid" in result.output
+    assert "run_reason=run_aborted" in result.output
+    assert '"noncomplete":[]' in result.output
+
+
 def test_receipt_failure_stops_before_diagnostic_without_recursive_compensation(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
