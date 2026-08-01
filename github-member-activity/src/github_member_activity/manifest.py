@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .canonical import canonical_bytes, sha256_bytes, sha256_json
+from .canonical import canonical_bytes, canonical_json, sha256_bytes, sha256_json
 from .metrics import aggregate
 from .models import LEDGER_FIELDS, SCHEMA_VERSION, SourceStatus
 from .period import parse_rfc3339
@@ -36,7 +36,7 @@ def run_id(observed_at: str, value: uuid.UUID | None = None) -> str:
 
 
 def ledger_text(rows: list[dict[str, Any]]) -> str:
-    return "".join(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for row in sorted(rows, key=lambda row: (row["member_id"], row["event_kind"], row["occurred_at"] or "~", row["contribution_day"] or "~", row["event_key"])))
+    return "".join(canonical_json(row) + "\n" for row in sorted(rows, key=lambda row: (row["member_id"], row["event_kind"], row["occurred_at"] or "~", row["contribution_day"] or "~", row["event_key"])))
 
 
 def source_status_object(rows: list[SourceStatus | dict[str, Any]]) -> dict[str, Any]:
@@ -64,7 +64,7 @@ def write_diagnostic(root: Path, manifest: dict[str, Any]) -> Path:
     if temp.exists():
         raise FileExistsError("output_conflict")
     temp.mkdir()
-    (temp / "run-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     temp.replace(target)
     return target
 
@@ -101,7 +101,7 @@ def write_published(root: Path, period_id: str, rid: str, files: dict[str, bytes
     manifest["publishable"] = True
     manifest["run_reason"] = None
     manifest["validator_result"] = {"status": "passed", "reason": None}
-    (temp / "run-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     if {path.name for path in temp.iterdir()} != {"run-manifest.json", *ARTIFACT_FILES.values()}:
         shutil.rmtree(temp)
         raise ValueError("directory_shape_invalid")
@@ -181,6 +181,7 @@ def _validate_status(value: dict[str, Any]) -> None:
     seen: set[tuple[str, str]] = set()
     allowed = {"member_id", "source", "criticality", "status", "reason", "pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at"}
     source_order = {name: index for index, name in enumerate(("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context"))}
+    reasons = {"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed", "stability_gap_not_met", "run_aborted", "search_capped", "search_incomplete_results", "search_cardinality_mismatch", "search_snapshot_unstable", "search_candidate_conflict", "graphql_partial_response", "graphql_snapshot_unstable", "graphql_cardinality_mismatch", "pagination_incomplete", "cursor_invalid", "rate_limited", "transport_retry_exhausted", "api_contract_violation", "visibility_unverified", "repository_binding_changed", "commit_context_unavailable", "commit_period_not_day_aligned", "member_window_empty"}
     previous: tuple[str, int] | None = None
     for row in value["rows"]:
         if not isinstance(row, dict) or set(row) != allowed:
@@ -197,6 +198,8 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["source"] != "commit_context" and row["criticality"] != "core":
             raise ValueError("source_status_invalid")
+        if row["reason"] is not None and row["reason"] not in reasons:
+            raise ValueError("source_status_invalid")
         if row["status"] == "complete" and not all(row[field] is True for field in ("pagination_complete", "snapshot_complete", "visibility_complete")):
             raise ValueError("source_status_invalid")
         if row["source"] in {"issue_replies", "prs_reviewed"} and row["status"] == "complete" and row["partition_complete"] is not None:
@@ -206,6 +209,8 @@ def _validate_status(value: dict[str, Any]) -> None:
         if row["status"] == "complete" and row["reason"] is not None:
             raise ValueError("source_status_invalid")
         if row["source"] == "commit_context" and row["status"] != "complete" and any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at")):
+            raise ValueError("source_status_invalid")
+        if row["status"] == "not_applicable" and any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at")):
             raise ValueError("source_status_invalid")
         if row["snapshot_complete"] is True and not isinstance(row["snapshot_completed_at"], str):
             raise ValueError("source_status_invalid")

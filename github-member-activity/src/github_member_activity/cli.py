@@ -10,7 +10,7 @@ from typing import Optional
 import typer
 
 from . import __version__
-from .canonical import sha256_bytes, sha256_json
+from .canonical import canonical_json, sha256_bytes, sha256_json
 from .collector import collect, empty_statuses
 from .config import AppConfig, load_config, member_config_sha256, safe_resolved_config, token_for
 from .github_client import GitHubClient
@@ -52,7 +52,7 @@ def _write_receipt(path: Path, report_period, rid: str, run_dir: Path) -> None:
     receipt = {"schema_version": "1.0", "period_id": report_period.id, "period_utc_slug": period_slug, "run_id": rid, "run_dir": str(run_dir), "manifest_sha256": manifest_sha}
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".github-member-activity-receipt.", delete=False) as stream:
         temp_path = Path(stream.name)
-        stream.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+        stream.write(canonical_json(receipt) + "\n")
     os.replace(temp_path, path)
 
 
@@ -124,10 +124,10 @@ def collect_command(
                 csv_value = render_csv(summary_value["members"])
                 markdown_value = render_markdown(summary_value, status_obj)
                 rid = summary_value["run_id"]
-                resolved_bytes = (json.dumps(resolved, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                resolved_bytes = (canonical_json(resolved) + "\n").encode("utf-8")
                 ledger_bytes = ledger_text(rows).encode("utf-8")
-                status_bytes = (json.dumps(status_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-                summary_bytes = (json.dumps(summary_value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+                status_bytes = (canonical_json(status_obj) + "\n").encode("utf-8")
+                summary_bytes = (canonical_json(summary_value) + "\n").encode("utf-8")
                 csv_bytes = csv_value.encode("utf-8")
                 report_bytes = markdown_value.encode("utf-8")
                 manifest_base = {

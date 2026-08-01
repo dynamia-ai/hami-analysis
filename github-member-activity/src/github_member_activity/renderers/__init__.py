@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..canonical import canonical_json
+
 
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    path.write_text(canonical_json(value) + "\n", encoding="utf-8")
 
 
 from .csv import render_csv

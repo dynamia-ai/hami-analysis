@@ -141,7 +141,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             if reason not in {"identity_type_mismatch", "identity_node_mismatch", "identity_login_mismatch"}:
                 reason = "identity_resolution_failed"
             for source in ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context"):
-                set_status(member.member_id, source, "failed", reason)
+                for index, row in enumerate(statuses):
+                    if row.member_id == member.member_id and row.source == source:
+                        statuses[index] = SourceStatus(member.member_id, source, row.criticality, "failed", reason)
             continue
 
         start, end = window

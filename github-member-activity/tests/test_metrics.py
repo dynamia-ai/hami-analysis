@@ -1,5 +1,6 @@
 from github_member_activity.metrics import aggregate
 from github_member_activity.models import LedgerEvent
+from github_member_activity.canonical import canonical_json
 
 
 def event(kind: str, node: str, subject: str, owner: str = "external") -> LedgerEvent:
@@ -21,3 +22,7 @@ def test_ledger_round_trip_is_not_recursive():
     value = row.to_dict()
     assert value["normalized_row_digest"] == row.normalized_row_digest
     assert type(row).from_dict(value) == row
+
+
+def test_canonical_json_rejects_floats_and_is_stable():
+    assert canonical_json({"b": 1, "a": [True, None]}) == '{"a":[true,null],"b":1}'
