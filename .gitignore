@@ -220,3 +220,10 @@ project-hami-weekly-report/evidence/
 project-hami-weekly-report/artifacts/
 project-hami-weekly-report/diagnostics/
 project-hami-weekly-report/output/
+
+# GitHub member-activity local runtime data. Its module-level .gitignore also
+# keeps the real config and generated artifacts out of Git.
+github-member-activity/.venv/
+github-member-activity/.env
+github-member-activity/output/
+github-member-activity/diagnostics/

@@ -1,0 +1,6 @@
+.venv/
+.env
+output/
+diagnostics/
+__pycache__/
+.pytest_cache/

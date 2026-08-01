@@ -1,0 +1,65 @@
+name: GitHub member activity
+
+on:
+  workflow_dispatch:
+    inputs:
+      period:
+        description: Completed period to collect
+        required: true
+        type: choice
+        options: [weekly, monthly]
+  schedule:
+    - cron: '15 1 * * 2'
+    - cron: '30 1 2 * *'
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: github-member-activity
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.14'
+      - uses: astral-sh/setup-uv@6b9c6063abd4a2e6e5c9c6d6d0c7d25f4c0b0c21
+        with:
+          version: latest
+      - id: collect
+        env:
+          PUBLIC_GITHUB_TOKEN: ${{ secrets.PUBLIC_GITHUB_TOKEN }}
+        run: |
+          set +e
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            selected_period="${{ inputs.period }}"
+          elif [ "${{ github.event.schedule }}" = "15 1 * * 2" ]; then
+            selected_period=weekly
+          elif [ "${{ github.event.schedule }}" = "30 1 2 * *" ]; then
+            selected_period=monthly
+          else
+            exit_code=4
+            echo "artifact_ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          uv sync --locked
+          uv run pytest
+          uv run github-member-activity validate-config --config ./config.example.yaml --scheduled
+          uv run github-member-activity collect --config ./config.example.yaml --period "$selected_period" --scheduled --receipt-path "$RUNNER_TEMP/github-member-activity-receipt.json"
+          exit_code=$?
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Upload verified artifact
+        if: always() && steps.collect.outputs.artifact_ready == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: github-member-activity-${{ steps.collect.outputs.period_id }}-${{ steps.collect.outputs.period_utc_slug }}-${{ steps.collect.outputs.manifest_sha256 }}
+          path: ${{ steps.collect.outputs.artifact_path }}
+          if-no-files-found: error
+      - name: Final gate
+        if: always()
+        run: exit "${{ steps.collect.outputs.exit_code || 4 }}"
