@@ -16,7 +16,7 @@ from .canonical import canonical_json, sha256_bytes, sha256_json
 from .collector import collect, empty_statuses
 from .config import AppConfig, load_config, member_config_sha256, safe_resolved_config, token_for
 from .github_client import GitHubClient
-from .manifest import ARTIFACTS, ARTIFACT_FILES, VALIDATOR_REASONS, digest_file, ledger_text, run_id, source_status_object, source_summary, verify_directory, write_diagnostic, write_published
+from .manifest import ARTIFACTS, ARTIFACT_FILES, STATUS_REASON, VALIDATOR_REASONS, digest_file, ledger_text, run_id, source_status_object, source_summary, verify_directory, write_diagnostic, write_published
 from .metrics import aggregate
 from .period import build_period, effective_window, format_z, validate_local_date
 from .renderers import render_csv, render_markdown, render_summary, write_json
@@ -26,6 +26,15 @@ app = typer.Typer(
     no_args_is_help=True,
     help="Public-only GitHub activity collector. Exit codes: 0 publishable run, 2 setup/configuration failure, 3 safe diagnostic run, 4 collection/core-source, receipt, verification, or artifact failure.",
 )
+
+DIAGNOSTIC_ERROR_CODES = frozenset().union(*STATUS_REASON.values(), VALIDATOR_REASONS, {"source_status_invalid", "diagnostic_state_invalid", "diagnostic_write_failed"})
+
+
+def _diagnostic_error_code(exc: Exception) -> str:
+    candidate = getattr(exc, "reason", None)
+    if not isinstance(candidate, str) and getattr(exc, "args", None):
+        candidate = exc.args[0]
+    return candidate if isinstance(candidate, str) and candidate in DIAGNOSTIC_ERROR_CODES else "diagnostic_write_failed"
 
 
 def _config(path: Path) -> AppConfig:
@@ -179,7 +188,7 @@ def collect_command(
             with GitHubClient(token, api_version=value.github.api_version) as client:
                 result = collect(value, report_period, client, observed_at=observed)
             statuses = result.statuses
-            reason = "core_source_incomplete" if any(row.criticality == "core" and row.status != "complete" for row in statuses) else None
+            reason = "core_source_incomplete" if any(row.criticality == "core" and row.status not in {"complete", "not_applicable"} for row in statuses) else None
             if reason is None:
                 phase = "build"
                 status_obj = source_status_object(statuses)
@@ -244,7 +253,6 @@ def collect_command(
                 statuses = empty_statuses(value, report_period, observed_at=observed)
     rid = run_id(format_z(observed))
     status_obj = source_status_object(statuses)
-    summary = {"core_complete": False, "optional_complete": False, "noncomplete": []}
     manifest = {
         "schema_version": "1.0", "run_id": rid, "collector": {"version": __version__, "git_commit": _git_commit(config)},
         "github_rest_api_version": value.github.api_version, "period": report_period.to_json(), "observed_at": format_z(observed),
@@ -259,10 +267,10 @@ def collect_command(
         diagnostics = _safe_output_root(config, "diagnostics")
         path = write_diagnostic(diagnostics, manifest)
     except Exception as exc:
-        detail = str(exc).strip() or type(exc).__name__
+        failure_summary = source_summary(status_obj)
         typer.echo(
-            f"Error: diagnostic artifact write failed: {type(exc).__name__}: {detail}; "
-            f"run_reason={reason}; failure={canonical_json(summary)}",
+            f"Error: diagnostic artifact write failed: error_code={_diagnostic_error_code(exc)}; "
+            f"run_reason={reason}; source_status_summary={canonical_json(failure_summary)}",
             err=True,
         )
         raise typer.Exit(4) from exc

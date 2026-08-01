@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENTS_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, _record_final_gate_failure, collect
+from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENTS_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, _gate_repository, _record_final_gate_auth_failure, _record_final_gate_failure, _record_optional_commit_gate_failure, collect
 from github_member_activity.config import AppConfig, RepositoryPolicyConfig
 from github_member_activity.github_client import GitHubRequestError, SearchPage
 from github_member_activity.manifest import _validate_status
@@ -180,6 +180,25 @@ class ReviewLateVisibilityFailureGitHub(ReviewSnapshotChangingGitHub):
     def graphql(self, query, variables):
         if "nodes(ids:$ids)" in query and "nameWithOwner" in query:
             return {"nodes": [{"__typename": "PullRequest", "id": "P1", "number": 1, "repository": {"id": "R1", "nameWithOwner": "owner/repo", "visibility": "PRIVATE", "owner": {"id": "O1", "login": "owner"}}}]}
+        return super().graphql(query, variables)
+
+
+class ReviewBotAndUserGitHub(EmptyGitHub):
+    def connection(self, query, variables, path):
+        if path == ("user", "contributionsCollection", "pullRequestReviewContributions"):
+            return [{"isRestricted": False, "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
+        if path == ("node", "reviews"):
+            return [
+                {"__typename": "PullRequestReview", "id": "BOT1", "author": {"__typename": "Bot", "id": "B1"}, "state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"},
+                {"__typename": "PullRequestReview", "id": "RV1", "author": {"__typename": "User", "id": "U_1"}, "state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"},
+            ]
+        return []
+
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query and "PullRequestReview" in query:
+            return {"nodes": [{"__typename": "PullRequestReview", "id": "RV1", "pullRequest": {"id": "P1", "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}}}]}
+        if "nodes(ids:$ids)" in query:
+            return {"nodes": [{"__typename": "PullRequest", "id": "P1", "number": 1, "repository": {"id": "R1", "nameWithOwner": "owner/repo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "owner"}}}]}
         return super().graphql(query, variables)
 
 
@@ -449,12 +468,51 @@ def test_review_late_visibility_failure_retains_snapshot_proof():
     assert row.snapshot_completed_at is not None
 
 
+def test_review_ignores_bot_reviews_and_counts_target_user_review():
+    config, period = _proof_fixture()
+    result = collect(config, period, ReviewBotAndUserGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
+    assert row.status == "complete"
+    assert [event.event_node_id for event in result.events if event.event_kind == "pr_reviewed"] == ["RV1"]
+
+
+def test_repository_gate_uses_repository_subject_directly():
+    repository = {"__typename": "Repository", "id": "R1", "nameWithOwner": "owner/repo", "visibility": "PUBLIC", "owner": {"id": "O1"}}
+    assert _gate_repository(repository) is repository
+
+
 def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_partial():
     sources = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
     statuses = [SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-01-02T00:00:00Z") for source in sources]
     _record_final_gate_failure(statuses, "alice", "issue_replies", "graphql_partial_response")
     row = next(row for row in statuses if row.source == "issue_replies")
     assert (row.status, row.pagination_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", True, True, False, "2026-01-02T00:00:00Z")
+    _validate_status({"schema_version": "1.0", "rows": [row.to_dict() for row in statuses]})
+
+
+def test_optional_commit_gate_failure_normalizes_and_drops_proof():
+    sources = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
+    statuses = [SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-01-02T00:00:00Z") for source in sources]
+    _record_optional_commit_gate_failure(statuses, "alice")
+    row = next(row for row in statuses if row.source == "commit_context")
+    assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", "commit_context_unavailable", None, None, None, None, None)
+    _validate_status({"schema_version": "1.0", "rows": [row.to_dict() for row in statuses]})
+
+
+def test_final_gate_auth_failure_normalizes_all_applicable_sources():
+    sources = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
+    statuses = [
+        SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-01-02T00:00:00Z")
+        for source in sources
+    ] + [
+        SourceStatus("bob", source, "optional" if source == "commit_context" else "core", "not_applicable", "member_window_empty")
+        for source in sources
+    ]
+    _record_final_gate_auth_failure(statuses)
+    alice = [row for row in statuses if row.member_id == "alice"]
+    bob = [row for row in statuses if row.member_id == "bob"]
+    assert all(row.status == "failed" and row.reason == "authentication_failed" and row.snapshot_completed_at is None for row in alice)
+    assert all(row.status == "not_applicable" for row in bob)
     _validate_status({"schema_version": "1.0", "rows": [row.to_dict() for row in statuses]})
 
 

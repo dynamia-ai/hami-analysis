@@ -56,11 +56,31 @@ def _record_final_gate_failure(statuses: list[SourceStatus], member_id: str, sou
         return
 
 
+def _record_optional_commit_gate_failure(statuses: list[SourceStatus], member_id: str) -> None:
+    for index, row in enumerate(statuses):
+        if row.member_id == member_id and row.source == "commit_context" and row.status == "complete":
+            statuses[index] = SourceStatus(row.member_id, row.source, row.criticality, "partial", "commit_context_unavailable")
+            return
+
+
+def _record_final_gate_auth_failure(statuses: list[SourceStatus]) -> None:
+    applicable_members = {row.member_id for row in statuses if row.status != "not_applicable"}
+    for index, row in enumerate(statuses):
+        if row.member_id in applicable_members:
+            statuses[index] = SourceStatus(row.member_id, row.source, row.criticality, "failed", "authentication_failed")
+
+
 def _exception_reason(exc: Exception, fallback: str) -> str:
     reason = getattr(exc, "reason", None)
     if not isinstance(reason, str) and getattr(exc, "args", None):
         reason = exc.args[0]
     return reason if isinstance(reason, str) and reason else fallback
+
+
+def _gate_repository(node: Any) -> dict[str, Any] | None:
+    if not isinstance(node, dict):
+        return None
+    return node if node.get("__typename") == "Repository" else node.get("repository") if isinstance(node.get("repository"), dict) else None
 
 
 @dataclass(slots=True)
@@ -707,14 +727,16 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 for pr_id in sorted(pr_ids):
                     reviews = client.connection(REVIEWS_QUERY, {"id": pr_id}, ("node", "reviews"))
                     eligible_reviews: list[dict[str, Any]] = []
+                    target_review_seen = False
                     for review in reviews:
+                        if not isinstance(review, dict) or review.get("__typename") != "PullRequestReview" or not isinstance(review.get("id"), str) or not review.get("id"):
+                            raise RuntimeError("api_contract_violation")
                         author = review.get("author")
+                        if not isinstance(author, dict) or author.get("__typename") != "User" or author.get("id") != member.github_node_id:
+                            continue
+                        target_review_seen = True
                         state = review.get("state")
                         submitted = review.get("submittedAt")
-                        if not isinstance(review, dict) or review.get("__typename") != "PullRequestReview" or not isinstance(review.get("id"), str) or not review.get("id") or not isinstance(author, dict) or author.get("__typename") != "User":
-                            raise RuntimeError("api_contract_violation")
-                        if author.get("id") != member.github_node_id:
-                            continue
                         if state == "PENDING":
                             if submitted is not None:
                                 raise RuntimeError("api_contract_violation")
@@ -724,6 +746,8 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         parsed = parse_rfc3339(submitted)
                         if start.astimezone(UTC) <= parsed < end.astimezone(UTC):
                             eligible_reviews.append({"id": review.get("id"), "submitted": submitted})
+                    if not target_review_seen:
+                        raise RuntimeError("api_contract_violation")
                     if eligible_reviews:
                         reps.append((pr_id, min(eligible_reviews, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
                 digest = tuple(sorted((pr_id, str(review["id"]), review["submitted"]) for pr_id, review in reps))
@@ -814,7 +838,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 discovery = _ordered_node_map(discovery_nodes, subject_ids)
                 for event in source_events:
                     node = discovery.get(event.subject_node_id)
-                    repo = node.get("repository") if isinstance(node, dict) else node
+                    repo = _gate_repository(node)
                     expected_type = "Repository" if event.event_kind == "commit_day" else "Issue" if event.event_kind in {"issue_opened", "issue_replied"} else "PullRequest"
                     if not isinstance(node, dict) or node.get("id") != event.subject_node_id or node.get("__typename") != expected_type or not isinstance(repo, dict) or repo.get("id") != event.repo_node_id or repo.get("visibility") != "PUBLIC" or (repo.get("owner") or {}).get("id") != event.owner_node_id:
                         raise RuntimeError("repository_binding_changed")
@@ -836,7 +860,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 hydration = _ordered_node_map(hydration_nodes, subject_ids)
                 for event in source_events:
                     node = hydration.get(event.subject_node_id)
-                    repo = node if isinstance(node, dict) and node.get("__typename") == "Repository" else (node.get("repository") if isinstance(node, dict) else None)
+                    repo = _gate_repository(node)
                     if not isinstance(node, dict) or not isinstance(repo, dict) or repo.get("id") != event.repo_node_id or repo.get("visibility") != "PUBLIC" or repo.get("nameWithOwner") != event.repo_full_name or (repo.get("owner") or {}).get("id") != event.owner_node_id:
                         raise RuntimeError("repository_binding_changed")
                 for event in source_events:
@@ -850,9 +874,14 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                             applied_repos.add(event.repo_node_id)
             except Exception as exc:
                 reason = _exception_reason(exc, "visibility_unverified")
-                for row in list(statuses):
-                    if row.status == "complete" and row.member_id == member_id and row.source == source:
-                        _record_final_gate_failure(statuses, row.member_id, row.source, reason)
+                if reason == "authentication_failed":
+                    _record_final_gate_auth_failure(statuses)
+                elif source == "commit_context" and reason != "repository_binding_changed":
+                    _record_optional_commit_gate_failure(statuses, member_id)
+                else:
+                    for row in list(statuses):
+                        if row.status == "complete" and row.member_id == member_id and row.source == source:
+                            _record_final_gate_failure(statuses, row.member_id, row.source, reason)
         gate_at = datetime.now(UTC).replace(microsecond=0)
         events = [replace(event, visibility_verified_at=format_z(gate_at)) for event in verified_events]
     if gate_at is None:

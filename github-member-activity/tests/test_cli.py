@@ -139,6 +139,51 @@ def test_build_oserror_is_artifact_write_failure_and_writes_diagnostic(tmp_path,
     assert '"run_reason":"artifact_write_failed"' in (diagnostic[0] / "run-manifest.json").read_text(encoding="utf-8")
 
 
+def test_cli_publishes_when_inactive_member_core_sources_are_not_applicable(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """github:
+  token_env: PUBLIC_GITHUB_TOKEN
+period:
+  timezone: UTC
+members:
+  - member_id: alice
+    github_login: Alice
+    github_node_id: U_1
+    active_from: 2020-01-01
+    active_until: null
+  - member_id: bob
+    github_login: Bob
+    github_node_id: U_2
+    active_from: 2099-01-01
+    active_until: null
+repository_policy:
+  public_only: true
+  first_party_owners: []
+  excluded_owner_ids: []
+  excluded_repo_ids: []
+output:
+  directory: ./output
+""",
+        encoding="utf-8",
+    )
+    observed = "2099-01-01T00:00:00Z"
+    sources = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
+    statuses = [
+        SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, observed)
+        for source in sources
+    ] + [
+        SourceStatus("bob", source, "optional" if source == "commit_context" else "core", "not_applicable", "member_window_empty")
+        for source in sources
+    ]
+    monkeypatch.setattr(cli_module, "token_for", lambda value: "test-token")
+    monkeypatch.setattr(cli_module, "collect", lambda *args, **kwargs: CollectionResult([], statuses, [], [], observed))
+    result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly"])
+    assert result.exit_code == 0
+    assert "published:" in result.stdout
+    assert list((tmp_path / "output").glob("weekly-*/*/run-manifest.json"))
+
+
 def test_diagnostic_write_failure_exposes_safe_reason_and_source_summary(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
@@ -159,9 +204,10 @@ def test_diagnostic_write_failure_exposes_safe_reason_and_source_summary(tmp_pat
     monkeypatch.setattr(cli_module, "write_diagnostic", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("diagnostic_state_invalid")))
     result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly"])
     assert result.exit_code == 4
-    assert "diagnostic artifact write failed: ValueError: diagnostic_state_invalid" in result.output
+    assert "diagnostic artifact write failed: error_code=diagnostic_state_invalid" in result.output
     assert "run_reason=run_aborted" in result.output
-    assert '"noncomplete":[]' in result.output
+    assert 'source_status_summary=' in result.output
+    assert "diagnostic_state_invalid" not in result.output.split("source_status_summary=", 1)[1]
 
 
 def test_receipt_failure_stops_before_diagnostic_without_recursive_compensation(tmp_path, monkeypatch):
