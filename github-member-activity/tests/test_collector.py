@@ -37,6 +37,21 @@ class SearchActorMismatchGitHub:
         return []
 
 
+class EmptyHydrationGitHub:
+    def graphql(self, query, variables):
+        if "user(login" in query:
+            return {"user": {"__typename": "User", "id": "U_1", "login": "Alice"}}
+        if "nodes(ids:$ids)" in query:
+            return {"nodes": []}
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": []}}}
+
+    def search(self, query, *, page=1):
+        return SearchPage(({"node_id": "N1", "actor_node_id": "U_1", "created_at": "2026-01-02T00:00:00Z"},), 1, False)
+
+    def connection(self, query, variables, path):
+        return []
+
+
 class CommitPartitionGitHub:
     def __init__(self, *, always_next=False, terminal_count=1):
         self.calls = []
@@ -169,6 +184,21 @@ def test_search_actor_mismatch_is_failed_conflict_not_partial_snapshot():
     rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
     for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
         assert (rows[source].status, rows[source].reason) == ("failed", "search_candidate_conflict")
+
+
+def test_search_proof_survives_failed_discovery_without_hydration_overwrite():
+    config = AppConfig.model_validate({
+        "github": {"token_env": "PUBLIC_GITHUB_TOKEN"}, "period": {"timezone": "UTC"},
+        "members": [{"member_id": "alice", "github_login": "Alice", "github_node_id": "U_1", "active_from": date(2020, 1, 1)}],
+        "repository_policy": {"public_only": True, "first_party_owners": []}, "output": {"directory": "./output"},
+    })
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-08T00:00:00Z")
+    result = collect(config, period, EmptyHydrationGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason) == ("failed", "visibility_unverified")
+        assert (row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == (True, True, False, False, None)
 
 
 def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_partial():

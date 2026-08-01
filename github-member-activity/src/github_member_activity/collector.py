@@ -18,6 +18,7 @@ _FAILED_REASONS = frozenset({
     "authentication_failed", "search_candidate_conflict", "graphql_cardinality_mismatch", "cursor_invalid",
     "api_contract_violation", "visibility_unverified", "repository_binding_changed",
 })
+_IDENTITY_REASONS = frozenset({"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed"})
 _PARTIAL_REASONS = frozenset({
     "search_capped", "search_incomplete_results", "search_cardinality_mismatch", "search_snapshot_unstable",
     "graphql_partial_response", "graphql_snapshot_unstable", "pagination_incomplete", "rate_limited",
@@ -389,6 +390,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
     policy = config.repository_policy
     applied_owners: set[str] = set()
     applied_repos: set[str] = set()
+    search_proofs: set[tuple[str, str]] = set()
     allowed_reasons = {"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed", "stability_gap_not_met", "run_aborted", "search_capped", "search_incomplete_results", "search_cardinality_mismatch", "search_snapshot_unstable", "search_candidate_conflict", "graphql_partial_response", "graphql_snapshot_unstable", "graphql_cardinality_mismatch", "pagination_incomplete", "cursor_invalid", "rate_limited", "transport_retry_exhausted", "api_contract_violation", "visibility_unverified", "repository_binding_changed", "commit_context_unavailable", "commit_period_not_day_aligned", "member_window_empty"}
 
     def set_status(member_id: str, source: str, status: str, reason: str | None, finished: datetime | None = None) -> None:
@@ -405,7 +407,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     timestamp = format_z(finished or observed_at)
                 else:
                     timestamp = None
-                    if status in {"not_applicable", "not_run"} or reason in {"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed"} or source == "commit_context":
+                    if (member_id, source) in search_proofs and source != "commit_context" and reason not in _IDENTITY_REASONS:
+                        pagination, partition, snapshot, visibility = True, True, False, False
+                    elif status in {"not_applicable", "not_run"} or reason in _IDENTITY_REASONS or source == "commit_context":
                         pagination = partition = snapshot = visibility = None
                     else:
                         pagination = False
@@ -452,6 +456,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 if any(candidate.actor_node_id != member.github_node_id for candidate in candidates):
                     raise RuntimeError("search_candidate_conflict")
                 candidate_rows[source] = (kind, time_field, candidates)
+                search_proofs.add((member.member_id, source))
             except Exception as exc:
                 set_status(member.member_id, source, "partial", _exception_reason(exc, "search_snapshot_unstable"))
 
@@ -474,7 +479,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     break
                 discovery_nodes = list(discovery_map.values())
                 discovery_snapshots.append(tuple(sorted((node.get("id"), node.get("__typename"), (node.get("author") or {}).get("id"), node.get("createdAt"), node.get("mergedAt"), (node.get("repository") or {}).get("id"), (node.get("repository") or {}).get("visibility"), ((node.get("repository") or {}).get("owner") or {}).get("id")) for node in discovery_nodes)))
-            if not discovery_snapshots or discovery_snapshots[0] != discovery_snapshots[1]:
+            if rest_ready and (not discovery_snapshots or discovery_snapshots[0] != discovery_snapshots[1]):
                 for source, _, _, _ in all_candidates:
                     set_status(member.member_id, source, "partial", "graphql_snapshot_unstable")
                 rest_ready = False
@@ -488,13 +493,14 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 for source, _, _, _ in all_candidates:
                     set_status(member.member_id, source, "failed", "visibility_unverified")
                 rest_ready = False
-            try:
-                by_id = _ordered_node_map(nodes, candidate_ids)
-            except RuntimeError:
-                for source, _, _, _ in all_candidates:
-                    set_status(member.member_id, source, "failed", "api_contract_violation")
-                by_id = {}
-                rest_ready = False
+            by_id: dict[str, dict[str, Any]] = {}
+            if rest_ready:
+                try:
+                    by_id = _ordered_node_map(nodes, candidate_ids)
+                except RuntimeError:
+                    for source, _, _, _ in all_candidates:
+                        set_status(member.member_id, source, "failed", "api_contract_violation")
+                    rest_ready = False
             finished = datetime.now(UTC).replace(microsecond=0)
             if rest_ready:
                 for source, kind, time_field, candidate in all_candidates:
