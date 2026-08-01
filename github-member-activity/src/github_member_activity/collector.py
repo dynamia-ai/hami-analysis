@@ -260,7 +260,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     set_status(member.member_id, source, "failed", "visibility_unverified")
                     continue
                 if not public_and_allowed(metadata, policy):
-                    if metadata.node_id and metadata.visibility == "PUBLIC" and metadata.node_id in policy.excluded_repo_ids:
+                    if metadata.owner_node_id in policy.excluded_owner_ids:
+                        applied_owners.add(metadata.owner_node_id)
+                    if metadata.node_id in policy.excluded_repo_ids:
                         applied_repos.add(metadata.node_id)
                     continue
                 raw_time = node.get(time_field)
@@ -283,7 +285,6 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     continue
                 url_kind = "pull" if node["__typename"] == "PullRequest" else "issues"
                 events.append(LedgerEvent(member.member_id, member.github_node_id, kind, candidate.node_id, candidate.node_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), format_z(occurred), None, 1, format_z(finished), format_z(finished), f"search-{source}-{basic_utc(start)}--{basic_utc(end)}", f"https://github.com/{metadata.full_name}/{url_kind}/{number}"))
-                applied_owners.add(metadata.owner_node_id)
             for source, _, _, _ in all_candidates:
                 if not any(row.member_id == member.member_id and row.source == source and row.status in {"failed", "partial"} for row in statuses):
                     set_status(member.member_id, source, "complete", None, finished)
@@ -315,6 +316,10 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if metadata.visibility != "PUBLIC":
                         raise RuntimeError("visibility_unverified")
                     if not public_and_allowed(metadata, policy):
+                        if metadata.owner_node_id in policy.excluded_owner_ids:
+                            applied_owners.add(metadata.owner_node_id)
+                        if metadata.node_id in policy.excluded_repo_ids:
+                            applied_repos.add(metadata.node_id)
                         continue
                     eligible.append({"id": row["id"], "issue_id": issue.get("id"), "issue_number": issue.get("number"), "created": created, "repo": metadata})
                 digest = tuple(sorted((str(item["id"]), str(item["issue_id"]), item["created"]) for item in eligible))
@@ -390,6 +395,10 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if metadata.visibility != "PUBLIC":
                         raise RuntimeError("visibility_unverified")
                     if not public_and_allowed(metadata, policy) or not isinstance(node.get("number"), int):
+                        if metadata.owner_node_id in policy.excluded_owner_ids:
+                            applied_owners.add(metadata.owner_node_id)
+                        if metadata.node_id in policy.excluded_repo_ids:
+                            applied_repos.add(metadata.node_id)
                         continue
                     events.append(LedgerEvent(member.member_id, member.github_node_id, "pr_reviewed", str(review["id"]), pr_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), format_z(parse_rfc3339(review["submitted"])), None, 1, format_z(finished), format_z(finished), "root", f"https://github.com/{metadata.full_name}/pull/{node['number']}"))
                 set_status(member.member_id, "prs_reviewed", "complete", None, finished)

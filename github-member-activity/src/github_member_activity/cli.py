@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -187,6 +188,8 @@ def collect_command(
 @app.command("verify")
 def verify(run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay=False), expected_manifest_sha256: str | None = typer.Option(None, "--expected-manifest-sha256")) -> None:
     try:
+        if expected_manifest_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256):
+            raise ValueError("invalid manifest hash")
         manifest, code = verify_directory(run_dir)
         if expected_manifest_sha256 and digest_file(run_dir / "run-manifest.json") != expected_manifest_sha256:
             raise ValueError("manifest hash mismatch")
