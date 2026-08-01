@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, _record_final_gate_failure, collect
+from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENTS_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, _record_final_gate_failure, collect
 from github_member_activity.config import AppConfig, RepositoryPolicyConfig
 from github_member_activity.github_client import GitHubRequestError, SearchPage
 from github_member_activity.manifest import _validate_status
@@ -459,6 +459,6 @@ def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_parti
 
 
 def test_graphql_actor_author_uses_user_fragment_for_schema_compatibility():
-    for query in (DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY):
+    for query in (DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENTS_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY):
         assert "author { __typename id }" not in query
         assert "... on User { id }" in query

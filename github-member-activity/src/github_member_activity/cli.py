@@ -24,7 +24,7 @@ from .renderers import render_csv, render_markdown, render_summary, write_json
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Public-only GitHub activity collector. Exit codes: 0 publishable, 2 setup/configuration, 3 diagnostic run, 4 integrity/artifact failure.",
+    help="Public-only GitHub activity collector. Exit codes: 0 publishable run, 2 setup/configuration failure, 3 safe diagnostic run, 4 collection/core-source, receipt, verification, or artifact failure.",
 )
 
 

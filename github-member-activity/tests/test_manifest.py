@@ -1,11 +1,24 @@
 import json
+import os
+from pathlib import Path
 import pytest
+import subprocess
+import sys
 
 from github_member_activity.manifest import ARTIFACT_FILES, ledger_text, source_status_object, source_summary, verify_directory, write_published, write_diagnostic
 from github_member_activity.metrics import aggregate
 from github_member_activity.models import LedgerEvent, SourceStatus
 from github_member_activity.renderers import render_csv, render_markdown, render_summary
 from github_member_activity.canonical import canonical_json, sha256_bytes, sha256_json
+
+
+def _committed_published_fixture(tmp_path):
+    root = Path(__file__).parents[1]
+    fixture = root / "tests" / "fixtures" / "workflow" / "build_fixture.py"
+    env = {**os.environ, "PYTHONPATH": str(root / "src"), "RUNNER_TEMP": str(tmp_path / "runner")}
+    Path(env["RUNNER_TEMP"]).mkdir()
+    subprocess.run([sys.executable, str(fixture), "published"], cwd=tmp_path, env=env, check=True)
+    return tmp_path / "output" / "weekly-20260727--20260803" / "20260804t000000z-00000000-0000-4000-8000-000000000000"
 
 
 @pytest.mark.parametrize(
@@ -80,3 +93,25 @@ def test_published_run_replays_and_rejects_tampering(tmp_path):
         pass
     else:
         raise AssertionError("tampered artifact was accepted")
+
+
+@pytest.mark.parametrize("shape", ["extra_file", "extra_dir", "symlink", "hardlink", "fifo", "diagnostic_boundary"])
+def test_committed_published_artifact_shape_and_boundary_attacks_fail_closed(tmp_path, shape):
+    path = _committed_published_fixture(tmp_path)
+    if shape == "extra_file":
+        (path / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+    elif shape == "extra_dir":
+        (path / "unexpected").mkdir()
+    elif shape == "symlink":
+        (path / "unexpected").symlink_to(path / "run-manifest.json")
+    elif shape == "hardlink":
+        (path / "unexpected").hardlink_to(path / "run-manifest.json")
+    elif shape == "fifo":
+        os.mkfifo(path / "unexpected")
+    else:
+        boundary = tmp_path / "diagnostics" / path.name
+        boundary.parent.mkdir(parents=True)
+        path.rename(boundary)
+        path = boundary
+    with pytest.raises(ValueError):
+        verify_directory(path)

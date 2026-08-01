@@ -1,4 +1,6 @@
 import subprocess
+from datetime import UTC, datetime
+import json
 from pathlib import Path
 
 import pytest
@@ -6,8 +8,10 @@ from typer.testing import CliRunner
 
 import github_member_activity.cli as cli_module
 from github_member_activity.collector import CollectionResult
-from github_member_activity.cli import _validate_receipt_path, app
+from github_member_activity.cli import _validate_receipt_path, _write_receipt, app
+from github_member_activity.canonical import canonical_json
 from github_member_activity.models import SourceStatus
+from github_member_activity.period import build_period
 
 
 RUNNER = CliRunner()
@@ -17,15 +21,23 @@ EXAMPLE_CONFIG = Path(__file__).parents[1] / "config.example.yaml"
 def test_cli_help_documents_stable_exit_codes():
     result = subprocess.run(["uv", "run", "github-member-activity", "--help"], capture_output=True, text=True, check=False)
     assert result.returncode == 0
-    assert "0 publishable" in result.stdout
-    assert "setup/configuration" in result.stdout
-    assert "diagnostic run" in result.stdout
-    assert "integrity/artifact failure" in result.stdout
+    help_text = " ".join(result.stdout.split())
+    assert "0 publishable run" in help_text
+    assert "2 setup/configuration failure" in help_text
+    assert "3 safe diagnostic run" in help_text
+    assert "4 collection/core-source, receipt, verification, or artifact failure" in help_text
 
 
 @pytest.mark.parametrize("command", ["verify", "render"])
 def test_cli_missing_run_directory_is_integrity_failure(command, tmp_path):
     result = RUNNER.invoke(app, [command, "--run-dir", str(tmp_path / "missing")])
+    assert result.exit_code == 4
+
+
+def test_cli_verify_rejects_invalid_expected_manifest_hash(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    result = RUNNER.invoke(app, ["verify", "--run-dir", str(run_dir), "--expected-manifest-sha256", "not-a-sha"])
     assert result.exit_code == 4
 
 
@@ -124,6 +136,64 @@ def test_receipt_failure_stops_before_diagnostic_without_recursive_compensation(
     result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly", "--scheduled", "--receipt-path", str(receipt)])
     assert result.exit_code == 4
     assert not (tmp_path / "diagnostics").exists()
+
+
+def test_receipt_transaction_is_canonical_bound_and_cleans_on_oserror(tmp_path, monkeypatch):
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-02T00:00:00Z")
+    rid = "20260103t000000z-00000000-0000-4000-8000-000000000000"
+    run_dir = tmp_path / "output" / period.id / rid
+    run_dir.mkdir(parents=True)
+    (run_dir / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+    manifest = {"run_id": rid, "period": {"id": period.id}}
+    monkeypatch.setattr("github_member_activity.cli.verify_directory", lambda path: (manifest, 0))
+    monkeypatch.setattr("github_member_activity.cli.digest_file", lambda path: "a" * 64)
+    receipt = runner_temp / "github-member-activity-receipt.json"
+    _write_receipt(receipt, period, rid, run_dir, tmp_path)
+    raw = receipt.read_bytes()
+    assert raw.endswith(b"\n")
+    assert json.loads(raw) == {"schema_version": "1.0", "period_id": period.id, "period_utc_slug": "20260101t000000z--20260102t000000z", "run_id": rid, "run_dir": f"output/{period.id}/{rid}", "manifest_sha256": "a" * 64}
+    assert raw == (canonical_json(json.loads(raw)) + "\n").encode()
+
+    receipt.unlink()
+    real_replace = cli_module.os.replace
+
+    def fail_replace(source, target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(cli_module.os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        _write_receipt(receipt, period, rid, run_dir, tmp_path)
+    assert not receipt.exists()
+    assert not list(runner_temp.glob(".github-member-activity-receipt.*"))
+    monkeypatch.setattr(cli_module.os, "replace", real_replace)
+
+
+def test_receipt_transaction_baseexception_never_publishes_fixed_receipt(tmp_path, monkeypatch):
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-02T00:00:00Z")
+    rid = "20260103t000000z-00000000-0000-4000-8000-000000000000"
+    run_dir = tmp_path / "output" / period.id / rid
+    run_dir.mkdir(parents=True)
+    (run_dir / "run-manifest.json").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr("github_member_activity.cli.verify_directory", lambda path: ({"run_id": rid, "period": {"id": period.id}}, 0))
+    monkeypatch.setattr("github_member_activity.cli.digest_file", lambda path: "b" * 64)
+
+    class Crash(BaseException):
+        pass
+
+    def crash_replace(source, target):
+        raise Crash()
+
+    monkeypatch.setattr(cli_module.os, "replace", crash_replace)
+    receipt = runner_temp / "github-member-activity-receipt.json"
+    with pytest.raises(Crash):
+        _write_receipt(receipt, period, rid, run_dir, tmp_path)
+    assert not receipt.exists()
 
 
 def test_workflow_run_blocks_are_shell_parseable():

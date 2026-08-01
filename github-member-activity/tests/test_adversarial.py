@@ -89,7 +89,7 @@ def test_commit_partial_reason_is_canonical_and_member_window_is_six_source_cons
 
 @pytest.mark.parametrize(
     ("snapshot_complete", "snapshot_completed_at"),
-    [(None, "2026-01-02T00:00:00Z"), (False, "2026-01-02T00:00:00Z"), (True, None)],
+    [(None, "2026-01-02T00:00:00Z"), (False, "2026-01-02T00:00:00Z"), (True, None), (True, 7), (True, "not-a-timestamp")],
 )
 def test_snapshot_completion_timestamp_is_bidirectionally_bound(snapshot_complete, snapshot_completed_at):
     status = _statuses(failed_source="prs_opened", failed_reason="search_capped")

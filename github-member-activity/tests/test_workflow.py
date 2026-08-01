@@ -1,23 +1,43 @@
 from pathlib import Path
+import os
 import re
 import subprocess
-import os
 import sys
 
+import pytest
 import yaml
 
 from github_member_activity.workflow_gate import evaluate
 
 
-def test_workflow_has_frozen_schedule_and_fail_gate():
+def _values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            assert key not in values
+            values[key] = value
+    return values
+
+
+def test_workflow_has_frozen_static_contract():
     root = Path(__file__).parents[2]
     text = root.joinpath(".github/workflows/github-member-activity.yml").read_text(encoding="utf-8")
     wrapper = root.joinpath("github-member-activity/scripts/workflow_wrapper.sh").read_text(encoding="utf-8")
     assert "cron: '15 1 * * 2'" in text
     assert "cron: '30 1 2 * *'" in text
-    assert "verify --run-dir" in wrapper
-    assert "--expected-manifest-sha256" in wrapper
+    assert "timeout-minutes: 120" in text
+    for action in (
+        "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+        "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+        "astral-sh/setup-uv@6b9c6063abd4a2e6e5c9c6d6d0c7d25f4c0b0c21",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    ):
+        assert action in text
+    assert "name: github-member-activity-${{ steps.collect.outputs.period_id }}-${{ steps.collect.outputs.period_utc_slug }}-${{ steps.collect.outputs.manifest_sha256 }}" in text
+    assert text.count("if: always()") == 2
     assert "if: always() && steps.collect.outputs.artifact_ready == 'true'" in text
+    assert "if: always()\n" in text
     assert "permissions:" in text and "contents: read" in text
     assert "PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG" in text
     assert "config.example.yaml" in wrapper
@@ -25,9 +45,13 @@ def test_workflow_has_frozen_schedule_and_fail_gate():
     data = yaml.safe_load(text)
     trigger = data.get("on", data.get(True))
     assert {item["cron"] for item in trigger["schedule"]} == {"15 1 * * 2", "30 1 2 * *"}
+    assert trigger["workflow_dispatch"]["inputs"]["period"]["options"] == ["weekly", "monthly"]
     assert "github_member_activity.workflow_gate" in wrapper
     assert "scripts/workflow_wrapper.sh" in text
     assert "scripts/final_gate.sh" in text
+    assert "--period \"$selected_period\" --scheduled" in wrapper
+    assert "--receipt-path \"$receipt\"" in wrapper
+    assert "--expected-manifest-sha256 \"$manifest_sha\"" in wrapper
 
 
 def test_workflow_exit_matrix_is_executable():
@@ -45,104 +69,240 @@ def test_workflow_exit_matrix_is_executable():
     for collector_code, receipt, status, publishable, reason, validator, verify_code, expected in cases:
         validator_reason = "ledger_invalid" if reason == "validation_failed" else ""
         assert evaluate(collector_code, receipt_present=receipt, manifest_status=status, manifest_publishable=publishable, manifest_reason=reason, validator_status=validator, validator_reason=validator_reason, verify_code=verify_code) == expected
-    command = ["uv", "run", "python", "-m", "github_member_activity.workflow_gate", "--collector-code", "3", "--receipt-present", "--manifest-status", "diagnostic", "--manifest-publishable", "False", "--manifest-reason", "no_applicable_members", "--validator-status", "not_run", "--verify-code", "3"]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    assert result.returncode == 0
-    assert "artifact_ready=true" in result.stdout
-    assert "exit_code=3" in result.stdout
 
 
-def test_final_gate_executes_frozen_upload_matrix(tmp_path):
+@pytest.mark.parametrize("collector_code", [0, 2, 3, 4])
+@pytest.mark.parametrize("artifact_ready", ["true", "false", ""])
+@pytest.mark.parametrize("upload_outcome", ["success", "failure", "skipped"])
+@pytest.mark.parametrize("period_kind", ["weekly", "monthly"])
+def test_final_gate_executes_all_frozen_72_combinations(collector_code, artifact_ready, upload_outcome, period_kind):
     gate = Path(__file__).parents[1] / "scripts" / "final_gate.sh"
-    cases = [
-        ({"COLLECT_EXIT_CODE": "0", "ARTIFACT_READY": "true", "UPLOAD_OUTCOME": "success"}, 0),
-        ({"COLLECT_EXIT_CODE": "3", "ARTIFACT_READY": "true", "UPLOAD_OUTCOME": "success"}, 3),
-        ({"COLLECT_EXIT_CODE": "4", "ARTIFACT_READY": "true", "UPLOAD_OUTCOME": "success"}, 4),
-        ({"COLLECT_EXIT_CODE": "0", "ARTIFACT_READY": "true", "UPLOAD_OUTCOME": "failure"}, 4),
-        ({"COLLECT_EXIT_CODE": "0", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 4),
-        ({"COLLECT_EXIT_CODE": "3", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 4),
-        ({"COLLECT_EXIT_CODE": "2", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 2),
-        ({"COLLECT_EXIT_CODE": "2", "ARTIFACT_READY": "true", "UPLOAD_OUTCOME": "success"}, 4),
-        ({"COLLECT_EXIT_CODE": "9", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 4),
-    ]
-    for variables, expected in cases:
-        result = subprocess.run([str(gate)], env={**__import__("os").environ, **variables}, check=False)
-        assert result.returncode == expected
-
-
-def test_production_wrapper_executes_setup_and_receipt_fail_closed_paths(tmp_path):
-    root = Path(__file__).parents[1]
-    wrapper = root / "scripts" / "workflow_wrapper.sh"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    (fake_bin / "uv").write_text(
-        "#!/usr/bin/env bash\n"
-        "if [ \"$2\" = \"github-member-activity\" ] && [ \"$3\" = \"validate-config\" ]; then exit 0; fi\n"
-        "if [ \"$2\" = \"github-member-activity\" ] && [ \"$3\" = \"collect\" ]; then exit 3; fi\n"
-        "exit 99\n",
-        encoding="utf-8",
+    result = subprocess.run(
+        [str(gate)],
+        env={**os.environ, "COLLECT_EXIT_CODE": str(collector_code), "ARTIFACT_READY": artifact_ready, "UPLOAD_OUTCOME": upload_outcome, "PERIOD_KIND": period_kind},
+        check=False,
     )
-    (fake_bin / "uv").chmod(0o755)
-
-    no_config_env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "RUNNER_TEMP": str(tmp_path / "runner-1"), "GITHUB_OUTPUT": str(tmp_path / "out-1")}
-    Path(no_config_env["RUNNER_TEMP"]).mkdir()
-    result = subprocess.run([str(wrapper)], cwd=root, env=no_config_env, text=True, capture_output=True, check=False)
-    assert result.returncode == 0
-    assert "artifact_ready=false" in Path(no_config_env["GITHUB_OUTPUT"]).read_text()
-    assert "exit_code=2" in Path(no_config_env["GITHUB_OUTPUT"]).read_text()
-
-    (tmp_path / "config.yaml").write_text("fixture\n", encoding="utf-8")
-    malformed_env = {**no_config_env, "RUNNER_TEMP": str(tmp_path / "runner-2"), "GITHUB_OUTPUT": str(tmp_path / "out-2"), "WORKFLOW_EVENT_NAME": "schedule", "WORKFLOW_SCHEDULE": "15 1 * * 2"}
-    Path(malformed_env["RUNNER_TEMP"]).mkdir()
-    result = subprocess.run([str(wrapper)], cwd=tmp_path, env=malformed_env, text=True, capture_output=True, check=False)
-    assert result.returncode == 0
-    output = Path(malformed_env["GITHUB_OUTPUT"]).read_text()
-    assert "collector_exit_code=3" in output
-    assert "artifact_ready=false" in output
-    assert "exit_code=4" in output
+    if collector_code in {0, 3}:
+        expected = collector_code if artifact_ready == "true" and upload_outcome == "success" else 4
+    elif collector_code == 2:
+        expected = 4 if artifact_ready == "true" else 2
+    else:
+        expected = 4
+    assert result.returncode == expected
 
 
-def test_committed_workflow_fixtures_execute_success_receipt_path_and_fault_matrix(tmp_path):
+def test_workflow_run_blocks_are_shell_parseable_and_all_production_runs_are_extracted():
+    root = Path(__file__).parents[1]
+    workflow = root.parents[0] / ".github" / "workflows" / "github-member-activity.yml"
+    text = workflow.read_text(encoding="utf-8")
+    wrapper = root / "scripts" / "workflow_wrapper.sh"
+    blocks = []
+    current = []
+    in_block = False
+    for line in text.splitlines():
+        if line.startswith("        run: |"):
+            in_block = True
+            current = []
+            continue
+        if in_block and line.startswith("      - "):
+            blocks.append("\n".join(current) + "\n")
+            in_block = False
+        elif in_block:
+            current.append(line[10:] if line.startswith("          ") else line)
+    if in_block:
+        blocks.append("\n".join(current) + "\n")
+    assert len(blocks) == 1
+    data = yaml.safe_load(text)
+    run_steps = [step["run"] for step in data["jobs"]["collect"]["steps"] if "run" in step]
+    assert len(run_steps) == 4
+    for block in run_steps:
+        completed = subprocess.run(["bash", "-n"], input=block + ("\n" if not block.endswith("\n") else ""), text=True, capture_output=True)
+        assert completed.returncode == 0, completed.stderr
+    for script in (wrapper, root / "scripts" / "final_gate.sh"):
+        completed = subprocess.run(["bash", "-n", str(script)], text=True, capture_output=True)
+        assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("mode", "ready", "exit_code", "collector_code"),
+    [
+        ("published", True, 0, 0),
+        ("diagnostic_success", True, 3, 3),
+        ("safe_diagnostic", True, 4, 4),
+        ("validation_failed", True, 4, 4),
+        ("collector_2", False, 2, 2),
+        ("collector_4", True, 4, 4),
+        ("verify_fail", False, 4, 3),
+        ("malformed_receipt", False, 4, 3),
+        ("receipt_pretty", False, 4, 3),
+        ("receipt_duplicate", False, 4, 3),
+        ("receipt_missing", False, 4, 3),
+        ("receipt_extra", False, 4, 3),
+        ("receipt_wrong_type", False, 4, 3),
+        ("receipt_wrong_hash", False, 4, 3),
+        ("receipt_wrong_period", False, 4, 3),
+        ("receipt_wrong_run", False, 4, 3),
+        ("receipt_wrong_slug", False, 4, 3),
+        ("receipt_absolute_path", False, 4, 3),
+        ("receipt_dotdot", False, 4, 3),
+        ("wrong_path_valid", False, 4, 3),
+        ("status_swap", False, 4, 3),
+        ("collector_crash", False, 4, 99),
+    ],
+)
+def test_committed_workflow_fixtures_execute_real_verify_receipt_path_and_fault_matrix(tmp_path, mode, ready, exit_code, collector_code):
     root = Path(__file__).parents[1]
     fixtures = root / "tests" / "fixtures" / "workflow"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "uv").write_text((fixtures / "fake_uv.sh").read_text(encoding="utf-8"), encoding="utf-8")
     (fake_bin / "uv").chmod(0o755)
-    base_env = {
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    runner_temp = run_root / "runner-temp"
+    runner_temp.mkdir()
+    output = run_root / "github-output"
+    args_log = run_root / "args.log"
+    env = {
         **os.environ,
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "PYTHONPATH": str(root / "src"),
         "PYTHON_EXECUTABLE": sys.executable,
         "FIXTURE_BUILDER": str(fixtures / "build_fixture.py"),
+        "FIXTURE_MODE": mode,
+        "FIXTURE_ARGS_LOG": str(args_log),
+        "RUNNER_TEMP": str(runner_temp),
+        "GITHUB_OUTPUT": str(output),
         "WORKFLOW_EVENT_NAME": "schedule",
         "WORKFLOW_SCHEDULE": "15 1 * * 2",
     }
-    cases = [("success", True, 3), ("malformed_receipt", False, 4), ("wrong_path", False, 4), ("collector_crash", False, 4)]
-    for index, (mode, ready, exit_code) in enumerate(cases):
-        run_root = tmp_path / f"run-{index}"
+    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    values = _values(output)
+    assert values["artifact_ready"] == ("true" if ready else "false")
+    assert values["exit_code"] == str(exit_code)
+    assert values["collector_exit_code"] == str(collector_code)
+    logged = args_log.read_text(encoding="utf-8") if args_log.exists() else ""
+    if ready or mode == "verify_fail":
+        assert "verify" in logged and "--expected-manifest-sha256" in logged
+    if ready:
+        assert values["artifact_path"]
+        assert values["manifest_sha256"]
+        if mode == "published":
+            assert (run_root / "output" / "weekly-20260727--20260803" / "20260804t000000z-00000000-0000-4000-8000-000000000000" / "run-manifest.json").is_file()
+        else:
+            assert (run_root / "diagnostics" / "20260804t000000z-00000000-0000-4000-8000-000000000000" / "run-manifest.json").is_file()
+        final = subprocess.run(
+            [str(root / "scripts" / "final_gate.sh")],
+            env={**env, "COLLECT_EXIT_CODE": values["exit_code"], "ARTIFACT_READY": values["artifact_ready"], "UPLOAD_OUTCOME": "success"},
+            check=False,
+        )
+        assert final.returncode == exit_code
+        failed_upload = subprocess.run(
+            [str(root / "scripts" / "final_gate.sh")],
+            env={**env, "COLLECT_EXIT_CODE": values["exit_code"], "ARTIFACT_READY": values["artifact_ready"], "UPLOAD_OUTCOME": "failure"},
+            check=False,
+        )
+        assert failed_upload.returncode == 4
+
+
+@pytest.mark.parametrize("event_name,schedule,dispatch,expected", [
+    ("schedule", "15 1 * * 2", "", "weekly"),
+    ("schedule", "30 1 2 * *", "", "monthly"),
+    ("workflow_dispatch", "", "weekly", "weekly"),
+    ("workflow_dispatch", "", "monthly", "monthly"),
+])
+def test_workflow_event_period_mapping_is_executed(tmp_path, event_name, schedule, dispatch, expected):
+    root = Path(__file__).parents[1]
+    fixtures = root / "tests" / "fixtures" / "workflow"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text((fixtures / "fake_uv.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (fake_bin / "uv").chmod(0o755)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    runner_temp = run_root / "runner-temp"
+    runner_temp.mkdir()
+    output = run_root / "github-output"
+    args_log = run_root / "args.log"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": str(root / "src"), "PYTHON_EXECUTABLE": sys.executable, "FIXTURE_BUILDER": str(fixtures / "build_fixture.py"), "FIXTURE_MODE": "diagnostic_success", "FIXTURE_ARGS_LOG": str(args_log), "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "WORKFLOW_EVENT_NAME": event_name, "WORKFLOW_SCHEDULE": schedule, "WORKFLOW_DISPATCH_PERIOD": dispatch}
+    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert f"--period {expected}" in args_log.read_text(encoding="utf-8")
+
+
+def test_workflow_unsupported_event_fails_without_collection(tmp_path):
+    root = Path(__file__).parents[1]
+    fixtures = root / "tests" / "fixtures" / "workflow"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text((fixtures / "fake_uv.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (fake_bin / "uv").chmod(0o755)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    runner_temp = run_root / "runner-temp"
+    runner_temp.mkdir()
+    output = run_root / "github-output"
+    log = run_root / "args.log"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": str(root / "src"), "PYTHON_EXECUTABLE": sys.executable, "FIXTURE_BUILDER": str(fixtures / "build_fixture.py"), "FIXTURE_MODE": "diagnostic_success", "FIXTURE_ARGS_LOG": str(log), "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "WORKFLOW_EVENT_NAME": "repository_dispatch", "WORKFLOW_SCHEDULE": ""}
+    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0
+    assert _values(output) == {"artifact_ready": "false", "exit_code": "4"}
+    assert "collect" not in log.read_text(encoding="utf-8")
+
+
+def test_stale_receipt_type_and_removal_matrix(tmp_path):
+    root = Path(__file__).parents[1]
+    fixtures = root / "tests" / "fixtures" / "workflow"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text((fixtures / "fake_uv.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (fake_bin / "uv").chmod(0o755)
+
+    def run_with_receipt(kind: str, rm_mode: str | None = None):
+        run_root = tmp_path / kind
         run_root.mkdir()
-        (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
         runner_temp = run_root / "runner-temp"
         runner_temp.mkdir()
+        receipt = runner_temp / "github-member-activity-receipt.json"
+        if kind == "symlink":
+            receipt.symlink_to(run_root / "elsewhere")
+        elif kind == "hardlink":
+            source = run_root / "source"
+            source.write_text("stale", encoding="utf-8")
+            receipt.hardlink_to(source)
+        elif kind == "directory":
+            receipt.mkdir()
+        elif kind == "fifo":
+            os.mkfifo(receipt)
+        else:
+            receipt.write_text("stale", encoding="utf-8")
+        bin_dir = fake_bin
+        if rm_mode:
+            bin_dir = run_root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "uv").write_text((fake_bin / "uv").read_text(encoding="utf-8"), encoding="utf-8")
+            (bin_dir / "uv").chmod(0o755)
+            (bin_dir / "rm").write_text("#!/usr/bin/env bash\n" + ("exit 0\n" if rm_mode == "keep" else "exit 1\n"), encoding="utf-8")
+            (bin_dir / "rm").chmod(0o755)
         output = run_root / "github-output"
-        env = {**base_env, "FIXTURE_MODE": mode, "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output)}
+        env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output)}
         result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
-        assert result.returncode == 0, result.stderr
-        values = output.read_text(encoding="utf-8")
-        assert f"artifact_ready={'true' if ready else 'false'}" in values
-        assert f"exit_code={exit_code}" in values
-        if ready:
-            assert (run_root / "diagnostics" / "20260801t000000z-00000000-0000-4000-8000-000000000000" / "run-manifest.json").is_file()
-            assert (runner_temp / "github-member-activity-receipt.json").is_file()
+        return result, output, receipt
 
-    (fake_bin / "rm").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
-    (fake_bin / "rm").chmod(0o755)
-    stale_env = {**base_env, "RUNNER_TEMP": str(tmp_path / "runner-3"), "GITHUB_OUTPUT": str(tmp_path / "out-3")}
-    Path(stale_env["RUNNER_TEMP"]).mkdir()
-    Path(stale_env["RUNNER_TEMP"]).joinpath("github-member-activity-receipt.json").write_text("stale\n", encoding="utf-8")
-    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=root, env=stale_env, text=True, capture_output=True, check=False)
-    assert result.returncode == 0
-    output = Path(stale_env["GITHUB_OUTPUT"]).read_text()
-    assert "artifact_ready=false" in output
-    assert "exit_code=4" in output
+    for kind in ("symlink", "hardlink", "directory", "fifo"):
+        result, output, _ = run_with_receipt(kind)
+        assert result.returncode == 0
+        assert _values(output) == {"artifact_ready": "false", "exit_code": "4"}
+    result, output, receipt = run_with_receipt("ordinary")
+    assert result.returncode == 0 and not receipt.exists()
+    assert _values(output) == {"artifact_ready": "false", "exit_code": "2"}
+    result, output, receipt = run_with_receipt("rm_failure", "fail")
+    assert result.returncode == 0 and receipt.exists()
+    assert _values(output) == {"artifact_ready": "false", "exit_code": "4"}
+    result, output, receipt = run_with_receipt("rm_keeps", "keep")
+    assert result.returncode == 0 and receipt.exists()
+    assert _values(output) == {"artifact_ready": "false", "exit_code": "4"}
