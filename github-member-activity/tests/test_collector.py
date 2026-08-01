@@ -5,7 +5,7 @@ import pytest
 
 from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, _record_final_gate_failure, collect
 from github_member_activity.config import AppConfig, RepositoryPolicyConfig
-from github_member_activity.github_client import SearchPage
+from github_member_activity.github_client import GitHubRequestError, SearchPage
 from github_member_activity.manifest import _validate_status
 from github_member_activity.models import SourceStatus
 from github_member_activity.period import build_period
@@ -50,6 +50,22 @@ class EmptyHydrationGitHub:
 
     def connection(self, query, variables, path):
         return []
+
+
+class DiscoveryGraphQLFailureGitHub(EmptyHydrationGitHub):
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query:
+            raise GitHubRequestError("graphql_partial_response")
+        return super().graphql(query, variables)
+
+
+class HydrationGraphQLFailureGitHub(EmptyHydrationGitHub):
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query and "repository { id visibility owner { id } }" in query:
+            return {"nodes": [{"__typename": "PullRequest", "id": "N1", "author": {"__typename": "User", "id": "U_1"}, "createdAt": "2026-01-02T00:00:00Z", "mergedAt": "2026-01-02T00:00:00Z", "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}}]}
+        if "nodes(ids:$ids)" in query:
+            raise GitHubRequestError("graphql_partial_response")
+        return super().graphql(query, variables)
 
 
 class CommitPartitionGitHub:
@@ -199,6 +215,37 @@ def test_search_proof_survives_failed_discovery_without_hydration_overwrite():
         row = rows[source]
         assert (row.status, row.reason) == ("failed", "visibility_unverified")
         assert (row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == (True, True, False, False, None)
+
+
+def test_discovery_graphql_failure_is_source_partial_and_collection_continues():
+    config = AppConfig.model_validate({
+        "github": {"token_env": "PUBLIC_GITHUB_TOKEN"}, "period": {"timezone": "UTC"},
+        "members": [{"member_id": "alice", "github_login": "Alice", "github_node_id": "U_1", "active_from": date(2020, 1, 1)}],
+        "repository_policy": {"public_only": True, "first_party_owners": []}, "output": {"directory": "./output"},
+    })
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-08T00:00:00Z")
+    result = collect(config, period, DiscoveryGraphQLFailureGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete) == ("partial", "graphql_partial_response", True, True, False, None)
+    assert rows["issue_replies"].status == "complete"
+    assert rows["prs_reviewed"].status == "complete"
+
+
+def test_hydration_graphql_failure_preserves_stable_snapshot_proof():
+    config = AppConfig.model_validate({
+        "github": {"token_env": "PUBLIC_GITHUB_TOKEN"}, "period": {"timezone": "UTC"},
+        "members": [{"member_id": "alice", "github_login": "Alice", "github_node_id": "U_1", "active_from": date(2020, 1, 1)}],
+        "repository_policy": {"public_only": True, "first_party_owners": []}, "output": {"directory": "./output"},
+    })
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-08T00:00:00Z")
+    result = collect(config, period, HydrationGraphQLFailureGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete) == ("partial", "graphql_partial_response", True, True, True, False)
+        assert row.snapshot_completed_at is not None
 
 
 def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_partial():

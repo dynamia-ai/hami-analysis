@@ -390,10 +390,10 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
     policy = config.repository_policy
     applied_owners: set[str] = set()
     applied_repos: set[str] = set()
-    search_proofs: set[tuple[str, str]] = set()
+    search_proofs: dict[tuple[str, str], str] = {}
     allowed_reasons = {"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed", "stability_gap_not_met", "run_aborted", "search_capped", "search_incomplete_results", "search_cardinality_mismatch", "search_snapshot_unstable", "search_candidate_conflict", "graphql_partial_response", "graphql_snapshot_unstable", "graphql_cardinality_mismatch", "pagination_incomplete", "cursor_invalid", "rate_limited", "transport_retry_exhausted", "api_contract_violation", "visibility_unverified", "repository_binding_changed", "commit_context_unavailable", "commit_period_not_day_aligned", "member_window_empty"}
 
-    def set_status(member_id: str, source: str, status: str, reason: str | None, finished: datetime | None = None) -> None:
+    def set_status(member_id: str, source: str, status: str, reason: str | None, finished: datetime | None = None, proof_override: tuple[bool | None, bool | None, bool | None, bool | None] | None = None) -> None:
         if reason is not None and reason not in allowed_reasons:
             reason = "api_contract_violation"
         status = _canonical_status(status, reason)
@@ -407,7 +407,10 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     timestamp = format_z(finished or observed_at)
                 else:
                     timestamp = None
-                    if (member_id, source) in search_proofs and source != "commit_context" and reason not in _IDENTITY_REASONS:
+                    if proof_override is not None:
+                        pagination, partition, snapshot, visibility = proof_override
+                        timestamp = format_z(finished) if snapshot and finished is not None else None
+                    elif (member_id, source) in search_proofs and source != "commit_context" and reason not in _IDENTITY_REASONS:
                         pagination, partition, snapshot, visibility = True, True, False, False
                     elif status in {"not_applicable", "not_run"} or reason in _IDENTITY_REASONS or source == "commit_context":
                         pagination = partition = snapshot = visibility = None
@@ -456,7 +459,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 if any(candidate.actor_node_id != member.github_node_id for candidate in candidates):
                     raise RuntimeError("search_candidate_conflict")
                 candidate_rows[source] = (kind, time_field, candidates)
-                search_proofs.add((member.member_id, source))
+                search_proofs[(member.member_id, source)] = format_z(datetime.now(UTC).replace(microsecond=0))
             except Exception as exc:
                 set_status(member.member_id, source, "partial", _exception_reason(exc, "search_snapshot_unstable"))
 
@@ -467,7 +470,14 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             discovery_snapshots: list[tuple[tuple[Any, ...], ...]] = []
             discovery_nodes: list[dict[str, Any]] = []
             for _ in range(2):
-                discovery_data = client.graphql(DISCOVERY_QUERY, {"ids": candidate_ids})
+                try:
+                    discovery_data = client.graphql(DISCOVERY_QUERY, {"ids": candidate_ids})
+                except Exception as exc:
+                    for source, _, _, _ in all_candidates:
+                        set_status(member.member_id, source, "partial", _exception_reason(exc, "graphql_partial_response"), proof_override=(True, True, False, None))
+                    discovery_nodes = []
+                    rest_ready = False
+                    break
                 raw_discovery = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
                 try:
                     discovery_map = _ordered_node_map(raw_discovery, candidate_ids)
@@ -487,7 +497,15 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 for source, _, _, _ in all_candidates:
                     set_status(member.member_id, source, "failed", "visibility_unverified")
                 rest_ready = False
-            data = client.graphql(HYDRATE_QUERY, {"ids": candidate_ids}) if rest_ready else {"nodes": []}
+            data = {"nodes": []}
+            if rest_ready:
+                try:
+                    data = client.graphql(HYDRATE_QUERY, {"ids": candidate_ids})
+                except Exception as exc:
+                    finished = datetime.now(UTC).replace(microsecond=0)
+                    for source, _, _, _ in all_candidates:
+                        set_status(member.member_id, source, "partial", _exception_reason(exc, "graphql_partial_response"), finished, proof_override=(True, True, True, False))
+                    rest_ready = False
             nodes = data.get("nodes") if isinstance(data, dict) else None
             if rest_ready and (not isinstance(nodes, list) or len(nodes) != len(candidate_ids)):
                 for source, _, _, _ in all_candidates:
