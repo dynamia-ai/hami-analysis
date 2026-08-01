@@ -25,6 +25,13 @@ def test_graphql_connection_rejects_boolean_total_count():
 
 
 def test_status_matrix_rejects_identity_partial_and_not_run_proofs():
+    legal = _statuses(failed_source="prs_opened", failed_reason="search_capped")
+    _validate_status(legal)
+    illegal = _statuses(failed_source="prs_opened", failed_reason="search_capped")
+    illegal["rows"][0]["pagination_complete"] = False
+    illegal["rows"][0]["partition_complete"] = True
+    with pytest.raises(ValueError, match="source_status_invalid"):
+        _validate_status(illegal)
     identity = _statuses(failed_source="prs_opened", failed_reason="identity_resolution_failed")
     with pytest.raises(ValueError, match="source_status_invalid"):
         _validate_status(identity)

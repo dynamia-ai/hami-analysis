@@ -216,11 +216,17 @@ def collect_command(
                 if receipt_path:
                     try:
                         _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
-                    except Exception:
-                        _remove_owned_run(path, rid)
-                        raise
+                    except Exception as receipt_exc:
+                        try:
+                            _remove_owned_run(path, rid)
+                        except Exception as cleanup_exc:
+                            typer.echo("Error: published artifact compensation failed; preserving the published artifact as the sole authority", err=True)
+                            raise typer.Exit(4) from cleanup_exc
+                        raise receipt_exc
                 typer.echo(f"published: {path}")
                 return
+        except typer.Exit:
+            raise
         except FileExistsError:
             reason = "output_conflict"
             if result is None:

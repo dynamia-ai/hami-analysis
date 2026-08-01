@@ -34,51 +34,70 @@ def _ordered_node_map(nodes: Any, ids: list[str]) -> dict[str, dict[str, Any]]:
 
 
 def _commit_group_pages(client: GitHubClient, login: str, start_day, end_day) -> tuple[list[dict[str, Any]], bool]:
-    cursor: str | None = None
-    seen_page_cursors: set[str] = set()
-    groups_by_repo: dict[str, dict[str, Any]] = {}
-    outer_capped = False
-    while True:
-        response = client.graphql(COMMIT_GROUPS_QUERY, {"login": login, "from": f"{start_day.isoformat()}T00:00:00Z", "to": f"{end_day.isoformat()}T23:59:59Z", "after": cursor})
+    variables = {"login": login, "from": f"{start_day.isoformat()}T00:00:00Z", "to": f"{end_day.isoformat()}T23:59:59Z"}
+
+    def read_groups(response: Any) -> list[dict[str, Any]]:
         groups = response.get("user", {}).get("contributionsCollection", {}).get("commitContributionsByRepository") if isinstance(response, dict) else None
         if not isinstance(groups, list) or len(groups) > 100:
             raise RuntimeError("commit_context_unavailable")
-        outer_capped = outer_capped or len(groups) == 100
-        page_next: list[str] = []
         page_repo_ids: set[str] = set()
         for group in groups:
             repo = group.get("repository") if isinstance(group, dict) else None
             connection = group.get("contributions") if isinstance(group, dict) else None
-            if not isinstance(repo, dict) or not isinstance(repo.get("id"), str) or not repo["id"] or not isinstance(connection, dict) or not isinstance(connection.get("edges"), list) or not isinstance(connection.get("pageInfo"), dict):
+            if not isinstance(repo, dict) or not isinstance(repo.get("id"), str) or not repo["id"] or repo["id"] in page_repo_ids or not isinstance(connection, dict) or not isinstance(connection.get("totalCount"), int) or isinstance(connection.get("totalCount"), bool) or connection["totalCount"] < 0 or not isinstance(connection.get("edges"), list) or not isinstance(connection.get("pageInfo"), dict):
                 raise RuntimeError("api_contract_violation")
+            page_repo_ids.add(repo["id"])
             page_info = connection["pageInfo"]
             if not isinstance(page_info.get("hasNextPage"), bool):
                 raise RuntimeError("api_contract_violation")
             end_cursor = page_info.get("endCursor")
             if end_cursor is not None and not isinstance(end_cursor, str):
                 raise RuntimeError("api_contract_violation")
-            repo_id = repo["id"]
-            if repo_id in page_repo_ids:
-                raise RuntimeError("api_contract_violation")
-            page_repo_ids.add(repo_id)
-            previous = groups_by_repo.get(repo_id)
-            if previous is None:
-                groups_by_repo[repo_id] = {"repository": repo, "contributions": {"totalCount": connection.get("totalCount"), "edges": list(connection["edges"]), "pageInfo": dict(page_info)}}
-            else:
-                if previous["repository"] != repo or previous["contributions"]["totalCount"] != connection.get("totalCount"):
-                    raise RuntimeError("api_contract_violation")
-                previous["contributions"]["edges"].extend(connection["edges"])
-                previous["contributions"]["pageInfo"] = dict(page_info)
-            if page_info["hasNextPage"]:
-                if not end_cursor:
-                    raise RuntimeError("cursor_invalid")
-                page_next.append(end_cursor)
-        if not page_next:
-            return list(groups_by_repo.values()), outer_capped
-        if len(page_next) != len(groups) or len(set(page_next)) != 1 or page_next[0] in seen_page_cursors:
+            if page_info["hasNextPage"] and not end_cursor:
+                raise RuntimeError("cursor_invalid")
+        return groups
+
+    def merge_page(groups_by_repo: dict[str, dict[str, Any]], group: dict[str, Any]) -> None:
+        repo = group["repository"]
+        connection = group["contributions"]
+        repo_id = repo["id"]
+        previous = groups_by_repo.get(repo_id)
+        if previous is None:
+            groups_by_repo[repo_id] = {"repository": repo, "contributions": {"totalCount": connection["totalCount"], "edges": list(connection["edges"]), "pageInfo": dict(connection["pageInfo"])}}
+            return
+        if previous["repository"] != repo or previous["contributions"]["totalCount"] != connection["totalCount"]:
+            raise RuntimeError("api_contract_violation")
+        previous["contributions"]["edges"].extend(connection["edges"])
+        previous["contributions"]["pageInfo"] = dict(connection["pageInfo"])
+
+    initial_groups = read_groups(client.graphql(COMMIT_GROUPS_QUERY, {**variables, "after": None}))
+    outer_capped = len(initial_groups) == 100
+    groups_by_repo: dict[str, dict[str, Any]] = {}
+    pending: dict[str, str] = {}
+    seen_cursors: dict[str, set[str]] = {}
+    for group in initial_groups:
+        merge_page(groups_by_repo, group)
+        repo_id = group["repository"]["id"]
+        page_info = group["contributions"]["pageInfo"]
+        if page_info["hasNextPage"]:
+            pending[repo_id] = page_info["endCursor"]
+            seen_cursors[repo_id] = {page_info["endCursor"]}
+    while pending:
+        repo_id, cursor = pending.popitem()
+        groups = read_groups(client.graphql(COMMIT_GROUPS_QUERY, {**variables, "after": cursor}))
+        matching = [group for group in groups if group["repository"]["id"] == repo_id]
+        if len(matching) != 1:
             raise RuntimeError("commit_context_unavailable")
-        seen_page_cursors.add(page_next[0])
-        cursor = page_next[0]
+        group = matching[0]
+        merge_page(groups_by_repo, group)
+        page_info = group["contributions"]["pageInfo"]
+        if page_info["hasNextPage"]:
+            next_cursor = page_info["endCursor"]
+            if next_cursor in seen_cursors[repo_id]:
+                raise RuntimeError("commit_context_unavailable")
+            seen_cursors[repo_id].add(next_cursor)
+            pending[repo_id] = next_cursor
+    return list(groups_by_repo.values()), outer_capped
 
 
 def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, start: datetime, end: datetime, policy) -> list[dict[str, Any]]:

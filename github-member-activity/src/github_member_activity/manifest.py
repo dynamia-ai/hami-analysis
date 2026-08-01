@@ -420,7 +420,11 @@ def _validate_status(value: dict[str, Any]) -> None:
         if row["status"] == "complete":
             if not isinstance(row["snapshot_completed_at"], str):
                 raise ValueError("source_status_invalid")
-        elif row["snapshot_complete"] is not None or row["snapshot_completed_at"] is not None:
+        elif row["status"] in {"not_applicable", "not_run"} and (row["snapshot_complete"] is not None or row["snapshot_completed_at"] is not None):
+            raise ValueError("source_status_invalid")
+        if row["partition_complete"] is True and row["pagination_complete"] is not True:
+            raise ValueError("source_status_invalid")
+        if row["snapshot_complete"] is True and row["pagination_complete"] is not True:
             raise ValueError("source_status_invalid")
         if row["status"] in {"not_applicable", "not_run"} or (row["status"] != "complete" and (row["reason"] in IDENTITY_REASONS or row["source"] == "commit_context")):
             if any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete")):

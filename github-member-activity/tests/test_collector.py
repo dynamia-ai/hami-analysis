@@ -64,6 +64,20 @@ class DuplicateCommitDayGitHub:
         }]}}}
 
 
+class MultiRepositoryCommitGitHub:
+    def graphql(self, query, variables):
+        if "nameWithOwner" in query and "commitContributionsByRepository" not in query:
+            return {"nodes": [{"__typename": "Repository", "id": repo_id, "nameWithOwner": f"owner/{repo_id.lower()}", "visibility": "PUBLIC", "owner": {"id": f"O-{repo_id}", "login": "owner"}} for repo_id in ("R1", "R2")]}
+        after = variables.get("after")
+        target = after.rsplit("-", 1)[0] if after else None
+        groups = []
+        for repo_id in ("R1", "R2"):
+            terminal = target == repo_id
+            edge = {"cursor": f"{repo_id}-c2" if terminal else f"{repo_id}-c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"2026-01-02T12:00:00Z" if terminal else "2026-01-01T12:00:00Z", "commitCount": 1, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": repo_id}}}
+            groups.append({"repository": {"id": repo_id, "visibility": "PUBLIC", "owner": {"id": f"O-{repo_id}"}}, "contributions": {"totalCount": 2, "edges": [edge], "pageInfo": {"hasNextPage": not terminal, "endCursor": None if terminal else f"{repo_id}-c1"}}})
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": groups}}}
+
+
 def test_commit_inner_connection_is_repartitioned_instead_of_truncated():
     client = CommitPartitionGitHub()
     rows = _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC), RepositoryPolicyConfig())
@@ -97,6 +111,11 @@ def test_restricted_commit_contribution_is_not_counted_or_hydrated():
 def test_duplicate_commit_day_fails_before_hydration():
     with pytest.raises(RuntimeError, match="graphql_cardinality_mismatch"):
         _commit_snapshot(DuplicateCommitDayGitHub(), "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
+
+
+def test_multi_repository_commit_connections_page_independently():
+    rows = _commit_snapshot(MultiRepositoryCommitGitHub(), "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC), RepositoryPolicyConfig())
+    assert {(row["repo"].node_id, row["day"]) for row in rows} == {(repo, day) for repo in ("R1", "R2") for day in ("2026-01-01", "2026-01-02")}
 
 
 def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
