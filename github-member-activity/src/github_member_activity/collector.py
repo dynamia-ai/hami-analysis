@@ -68,6 +68,7 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
         metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
         if metadata.visibility != "PUBLIC":
             raise RuntimeError("visibility_unverified")
+        contribution_total = 0
         for edge in connection["edges"]:
             node = edge.get("node") if isinstance(edge, dict) else None
             user = node.get("user") if isinstance(node, dict) else None
@@ -76,6 +77,9 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
             day = node["occurredAt"][:10]
             if start.date().isoformat() <= day < end.date().isoformat():
                 result.append({"repo": metadata, "day": day, "quantity": node["commitCount"]})
+            contribution_total += node["commitCount"]
+        if contribution_total != connection["totalCount"]:
+            raise RuntimeError("api_contract_violation")
     return result
 
 

@@ -30,9 +30,10 @@ class CommitPartitionGitHub:
         self.calls.append(variables)
         day = variables["from"][:10]
         has_next = self.always_next or (day == "2026-01-01" and variables["to"][:10] == "2026-01-03")
+        count = 2 if has_next else 1
         return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
             "repository": {"id": "R1", "nameWithOwner": "dynamia-ai/demo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "dynamia-ai"}},
-            "contributions": {"totalCount": 1, "edges": [{"cursor": "c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"{day}T12:00:00Z", "commitCount": 2, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}}], "pageInfo": {"hasNextPage": has_next, "endCursor": "c1"}},
+            "contributions": {"totalCount": count, "edges": [{"cursor": "c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"{day}T12:00:00Z", "commitCount": count, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}}], "pageInfo": {"hasNextPage": has_next, "endCursor": "c1"}},
         }]}}}
 
 
