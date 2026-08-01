@@ -18,7 +18,9 @@ def canonical_bytes(value: Any) -> bytes:
 
 def _normalize(value: Any) -> Any:
     if isinstance(value, dict):
-        return {key: _normalize(value[key]) for key in sorted(value, key=lambda item: str(item).encode("utf-16-be"))}
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("canonical JSON object keys must be strings")
+        return {key: _normalize(value[key]) for key in sorted(value, key=lambda item: item.encode("utf-16-be"))}
     if isinstance(value, list):
         return [_normalize(item) for item in value]
     if isinstance(value, float):

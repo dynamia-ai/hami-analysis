@@ -26,3 +26,8 @@ def test_ledger_round_trip_is_not_recursive():
 
 def test_canonical_json_rejects_floats_and_is_stable():
     assert canonical_json({"b": 1, "a": [True, None]}) == '{"a":[true,null],"b":1}'
+
+
+def test_complete_empty_commit_context_is_zero_not_null():
+    result = aggregate([], ["alice"], {"alice": "Alice"}, set(), {"alice": True})
+    assert result["members"][0]["metrics"]["commit_contributions"] == 0

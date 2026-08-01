@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from .models import LedgerEvent
 
 NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
+REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 
 
 def validate_evidence_url(event: LedgerEvent, login: str) -> None:
@@ -17,7 +18,8 @@ def validate_evidence_url(event: LedgerEvent, login: str) -> None:
         raise ValueError("invalid evidence URL") from exc
     if parts.scheme != "https" or parts.netloc != "github.com" or parts.username or port:
         raise ValueError("invalid evidence URL")
-    if any(part == "" or "/" in part or not NAME_RE.fullmatch(part) for part in event.repo_full_name.split("/")):
+    repo_parts = event.repo_full_name.split("/")
+    if len(repo_parts) != 2 or not NAME_RE.fullmatch(repo_parts[0]) or not REPO_RE.fullmatch(repo_parts[1]):
         raise ValueError("invalid repository name")
     if parts.path.split("/")[1:3] != event.repo_full_name.split("/"):
         raise ValueError("evidence repository mismatch")
