@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import AppConfig
@@ -19,6 +19,48 @@ class CollectionResult:
     applied_owner_ids: list[str]
     applied_repo_ids: list[str]
     publish_visibility_verified_at: str | None = None
+
+
+def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, start: datetime, end: datetime, policy) -> list[dict[str, Any]]:
+    variables = {"login": login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
+    groups = client.graphql(COMMIT_GROUPS_QUERY, variables).get("user", {}).get("contributionsCollection", {}).get("commitContributionsByRepository")
+    if not isinstance(groups, list) or len(groups) > 100:
+        raise RuntimeError("commit_context_unavailable")
+    if len(groups) == 100:
+        if end - start <= timedelta(days=1):
+            raise RuntimeError("commit_context_unavailable")
+        midpoint = start + timedelta(seconds=int((end - start).total_seconds() // 2))
+        left = _commit_snapshot(client, login, member_node_id, start, midpoint, policy)
+        right = _commit_snapshot(client, login, member_node_id, midpoint, end, policy)
+        merged: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in left + right:
+            key = (row["repo"].node_id, row["day"])
+            if key in merged and merged[key]["quantity"] != row["quantity"]:
+                raise RuntimeError("commit_context_unavailable")
+            merged[key] = row
+        return list(merged.values())
+    result: list[dict[str, Any]] = []
+    for group in groups:
+        repo = group.get("repository") if isinstance(group, dict) else None
+        connection = group.get("contributions") if isinstance(group, dict) else None
+        if not isinstance(repo, dict) or not isinstance(connection, dict) or not isinstance(connection.get("totalCount"), int) or not isinstance(connection.get("edges"), list) or not isinstance(connection.get("pageInfo"), dict):
+            raise RuntimeError("api_contract_violation")
+        if connection["totalCount"] != len(connection["edges"]) or connection["pageInfo"].get("hasNextPage"):
+            raise RuntimeError("commit_context_unavailable")
+        metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
+        if metadata.visibility != "PUBLIC":
+            raise RuntimeError("visibility_unverified")
+        if not public_and_allowed(metadata, policy):
+            continue
+        for edge in connection["edges"]:
+            node = edge.get("node") if isinstance(edge, dict) else None
+            user = node.get("user") if isinstance(node, dict) else None
+            if not isinstance(edge, dict) or not isinstance(edge.get("cursor"), str) or not isinstance(node, dict) or node.get("__typename") != "CreatedCommitContribution" or node.get("isRestricted") is not False or not isinstance(node.get("occurredAt"), str) or not isinstance(node.get("commitCount"), int) or node["commitCount"] <= 0 or not isinstance(user, dict) or user.get("__typename") != "User" or user.get("id") != member_node_id or not isinstance(node.get("repository"), dict) or node["repository"].get("id") != metadata.node_id:
+                raise RuntimeError("api_contract_violation")
+            day = node["occurredAt"][:10]
+            if start.date().isoformat() <= day < end.date().isoformat():
+                result.append({"repo": metadata, "day": day, "quantity": node["commitCount"]})
+    return result
 
 
 IDENTITY_QUERY = """
@@ -365,31 +407,8 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             try:
                 commit_snapshots: list[tuple[tuple[str, str, int], ...]] = []
                 last_commit_rows: list[dict[str, Any]] = []
-                commit_vars = {"login": member.github_login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
                 for _ in range(2):
-                    groups = client.graphql(COMMIT_GROUPS_QUERY, commit_vars).get("user", {}).get("contributionsCollection", {}).get("commitContributionsByRepository")
-                    if not isinstance(groups, list) or len(groups) >= 100:
-                        raise RuntimeError("commit_context_unavailable")
-                    current: list[dict[str, Any]] = []
-                    for group in groups:
-                        repo = group.get("repository") if isinstance(group, dict) else None
-                        connection = group.get("contributions") if isinstance(group, dict) else None
-                        if not isinstance(repo, dict) or not isinstance(connection, dict) or connection.get("pageInfo", {}).get("hasNextPage"):
-                            raise RuntimeError("commit_context_unavailable")
-                            if repo.get("visibility") != "PUBLIC":
-                                raise RuntimeError("visibility_unverified")
-                            continue
-                        metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
-                        if not public_and_allowed(metadata, policy):
-                            continue
-                        for edge in connection.get("edges", []):
-                            node = edge.get("node") if isinstance(edge, dict) else None
-                            user = node.get("user") if isinstance(node, dict) else None
-                            if not isinstance(node, dict) or node.get("isRestricted") is not False or not isinstance(user, dict) or user.get("id") != member.github_node_id or not isinstance(node.get("occurredAt"), str) or not isinstance(node.get("commitCount"), int) or node["commitCount"] <= 0:
-                                raise RuntimeError("api_contract_violation")
-                            day = node["occurredAt"][:10]
-                            if start.date().isoformat() <= day < end.date().isoformat():
-                                current.append({"repo": metadata, "day": day, "quantity": node["commitCount"]})
+                    current = _commit_snapshot(client, member.github_login, member.github_node_id, start, end, policy)
                     digest = tuple(sorted((item["repo"].node_id, item["day"], item["quantity"]) for item in current))
                     commit_snapshots.append(digest)
                     last_commit_rows = current
@@ -398,7 +417,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 finished = datetime.now(UTC).replace(microsecond=0)
                 for item in last_commit_rows:
                     metadata = item["repo"]
-                    next_day = (datetime.fromisoformat(item["day"]) + __import__("datetime").timedelta(days=1)).date().isoformat()
+                    next_day = (datetime.fromisoformat(item["day"]) + timedelta(days=1)).date().isoformat()
                     events.append(LedgerEvent(member.member_id, member.github_node_id, "commit_day", None, metadata.node_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), None, item["day"], item["quantity"], format_z(finished), format_z(finished), f"commit-root-{start.date().isoformat()}--{end.date().isoformat()}", f"https://github.com/{metadata.full_name}/commits?author={member.github_login}&since={item['day']}T00%3A00%3A00Z&until={next_day}T00%3A00%3A00Z"))
                 set_status(member.member_id, "commit_context", "complete", None, finished)
             except Exception as exc:
