@@ -9,6 +9,10 @@ case "$code" in
     fi
     exit "$code"
     ;;
-  2|4) exit "$code";;
+  2)
+    if [ "${ARTIFACT_READY:-false}" = "true" ]; then exit 4; fi
+    exit 2
+    ;;
+  4) exit 4;;
   *) exit 4;;
 esac

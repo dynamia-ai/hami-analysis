@@ -68,6 +68,37 @@ class HydrationGraphQLFailureGitHub(EmptyHydrationGitHub):
         return super().graphql(query, variables)
 
 
+def _discovery_node(visibility="PUBLIC", created_at="2026-01-02T00:00:00Z"):
+    return {"__typename": "PullRequest", "id": "N1", "author": {"__typename": "User", "id": "U_1"}, "createdAt": created_at, "mergedAt": created_at, "repository": {"id": "R1", "visibility": visibility, "owner": {"id": "O1"}}}
+
+
+class UnstableDiscoveryGitHub(EmptyHydrationGitHub):
+    def __init__(self):
+        self.discovery_calls = 0
+
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query:
+            self.discovery_calls += 1
+            return {"nodes": [_discovery_node(created_at="2026-01-02T00:00:00Z" if self.discovery_calls == 1 else "2026-01-03T00:00:00Z")]}
+        return super().graphql(query, variables)
+
+
+class PrivateDiscoveryGitHub(EmptyHydrationGitHub):
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query:
+            return {"nodes": [_discovery_node(visibility="PRIVATE")]}
+        return super().graphql(query, variables)
+
+
+class HydrationCardinalityGitHub(EmptyHydrationGitHub):
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query and "nameWithOwner" in query:
+            return {"nodes": []}
+        if "nodes(ids:$ids)" in query:
+            return {"nodes": [_discovery_node()]}
+        return super().graphql(query, variables)
+
+
 class CommitPartitionGitHub:
     def __init__(self, *, always_next=False, terminal_count=1):
         self.calls = []
@@ -245,6 +276,53 @@ def test_hydration_graphql_failure_preserves_stable_snapshot_proof():
     for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
         row = rows[source]
         assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete) == ("partial", "graphql_partial_response", True, True, True, False)
+        assert row.snapshot_completed_at is not None
+
+
+def _proof_fixture():
+    config = AppConfig.model_validate({
+        "github": {"token_env": "PUBLIC_GITHUB_TOKEN"}, "period": {"timezone": "UTC"},
+        "members": [{"member_id": "alice", "github_login": "Alice", "github_node_id": "U_1", "active_from": date(2020, 1, 1)}],
+        "repository_policy": {"public_only": True, "first_party_owners": []}, "output": {"directory": "./output"},
+    })
+    return config, build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-08T00:00:00Z")
+
+
+def test_actor_mismatch_retains_completed_search_proof():
+    config, period = _proof_fixture()
+    result = collect(config, period, SearchActorMismatchGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("failed", "search_candidate_conflict", True, True, False, False, None)
+
+
+def test_discovery_snapshot_instability_keeps_visibility_unattempted():
+    config, period = _proof_fixture()
+    result = collect(config, period, UnstableDiscoveryGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", "graphql_snapshot_unstable", True, True, False, None, None)
+
+
+def test_private_discovery_retains_stable_snapshot_timestamp():
+    config, period = _proof_fixture()
+    result = collect(config, period, PrivateDiscoveryGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete) == ("failed", "visibility_unverified", True, True, True, False)
+        assert row.snapshot_completed_at is not None
+
+
+def test_hydration_cardinality_failure_retains_stable_snapshot_timestamp():
+    config, period = _proof_fixture()
+    result = collect(config, period, HydrationCardinalityGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete) == ("failed", "visibility_unverified", True, True, True, False)
         assert row.snapshot_completed_at is not None
 
 

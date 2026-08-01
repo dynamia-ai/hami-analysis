@@ -61,6 +61,7 @@ def test_final_gate_executes_frozen_upload_matrix(tmp_path):
         ({"COLLECT_EXIT_CODE": "0", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 4),
         ({"COLLECT_EXIT_CODE": "3", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 4),
         ({"COLLECT_EXIT_CODE": "2", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 2),
+        ({"COLLECT_EXIT_CODE": "2", "ARTIFACT_READY": "true", "UPLOAD_OUTCOME": "success"}, 4),
         ({"COLLECT_EXIT_CODE": "9", "ARTIFACT_READY": "false", "UPLOAD_OUTCOME": "skipped"}, 4),
     ]
     for variables, expected in cases:
