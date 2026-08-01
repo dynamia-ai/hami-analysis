@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 import subprocess
 import os
+import sys
 
 import yaml
 
@@ -100,12 +101,47 @@ def test_production_wrapper_executes_setup_and_receipt_fail_closed_paths(tmp_pat
     assert "artifact_ready=false" in output
     assert "exit_code=4" in output
 
+
+def test_committed_workflow_fixtures_execute_success_receipt_path_and_fault_matrix(tmp_path):
+    root = Path(__file__).parents[1]
+    fixtures = root / "tests" / "fixtures" / "workflow"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "uv").write_text((fixtures / "fake_uv.sh").read_text(encoding="utf-8"), encoding="utf-8")
+    (fake_bin / "uv").chmod(0o755)
+    base_env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PYTHONPATH": str(root / "src"),
+        "PYTHON_EXECUTABLE": sys.executable,
+        "FIXTURE_BUILDER": str(fixtures / "build_fixture.py"),
+        "WORKFLOW_EVENT_NAME": "schedule",
+        "WORKFLOW_SCHEDULE": "15 1 * * 2",
+    }
+    cases = [("success", True, 3), ("malformed_receipt", False, 4), ("wrong_path", False, 4), ("collector_crash", False, 4)]
+    for index, (mode, ready, exit_code) in enumerate(cases):
+        run_root = tmp_path / f"run-{index}"
+        run_root.mkdir()
+        (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+        runner_temp = run_root / "runner-temp"
+        runner_temp.mkdir()
+        output = run_root / "github-output"
+        env = {**base_env, "FIXTURE_MODE": mode, "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output)}
+        result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
+        assert result.returncode == 0, result.stderr
+        values = output.read_text(encoding="utf-8")
+        assert f"artifact_ready={'true' if ready else 'false'}" in values
+        assert f"exit_code={exit_code}" in values
+        if ready:
+            assert (run_root / "diagnostics" / "20260801t000000z-00000000-0000-4000-8000-000000000000" / "run-manifest.json").is_file()
+            assert (runner_temp / "github-member-activity-receipt.json").is_file()
+
     (fake_bin / "rm").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
     (fake_bin / "rm").chmod(0o755)
-    stale_env = {**no_config_env, "RUNNER_TEMP": str(tmp_path / "runner-3"), "GITHUB_OUTPUT": str(tmp_path / "out-3")}
+    stale_env = {**base_env, "RUNNER_TEMP": str(tmp_path / "runner-3"), "GITHUB_OUTPUT": str(tmp_path / "out-3")}
     Path(stale_env["RUNNER_TEMP"]).mkdir()
     Path(stale_env["RUNNER_TEMP"]).joinpath("github-member-activity-receipt.json").write_text("stale\n", encoding="utf-8")
-    result = subprocess.run([str(wrapper)], cwd=root, env=stale_env, text=True, capture_output=True, check=False)
+    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=root, env=stale_env, text=True, capture_output=True, check=False)
     assert result.returncode == 0
     output = Path(stale_env["GITHUB_OUTPUT"]).read_text()
     assert "artifact_ready=false" in output

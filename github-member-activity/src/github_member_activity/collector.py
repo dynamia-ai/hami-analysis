@@ -462,7 +462,8 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 candidates = stable_search(client, base, start, end)
                 search_proofs[(member.member_id, source)] = format_z(datetime.now(UTC).replace(microsecond=0))
                 if any(candidate.actor_node_id != member.github_node_id for candidate in candidates):
-                    raise RuntimeError("search_candidate_conflict")
+                    set_status(member.member_id, source, "failed", "search_candidate_conflict", proof_override=(True, True, False, None))
+                    continue
                 candidate_rows[source] = (kind, time_field, candidates)
             except Exception as exc:
                 reason = _exception_reason(exc, "search_snapshot_unstable")
@@ -584,6 +585,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
 
         # Issue replies: UPDATED_AT is the only server ordering, so every page is
         # consumed before the createdAt and PR-conversation filters are applied.
+        issue_snapshot_at: datetime | None = None
         try:
             snapshots: list[tuple[tuple[str, str, str], ...]] = []
             snapshot_rows: list[dict[str, Any]] = []
@@ -657,6 +659,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             if snapshots[0] != snapshots[1]:
                 raise RuntimeError("graphql_snapshot_unstable")
             finished = datetime.now(UTC).replace(microsecond=0)
+            issue_snapshot_at = finished
             for item in snapshot_rows:
                 metadata = item["repo"]
                 if not isinstance(item["issue_number"], int) or not isinstance(item["issue_id"], str):
@@ -665,11 +668,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             set_status(member.member_id, "issue_replies", "complete", None, finished)
         except Exception as exc:
             reason = _exception_reason(exc, "graphql_partial_response")
-            proof = (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
-            set_status(member.member_id, "issue_replies", "partial", reason, proof_override=proof)
+            proof = (True, None, True, False) if issue_snapshot_at is not None else (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
+            set_status(member.member_id, "issue_replies", "partial", reason, finished=issue_snapshot_at, proof_override=proof)
 
         # Reviews use contribution nodes only to discover target PRs. The PR's
         # complete reviews connection supplies the canonical submittedAt event.
+        review_snapshot_at: datetime | None = None
         try:
             review_snapshots: list[tuple[tuple[str, str, str], ...]] = []
             representative_rows: list[tuple[str, dict[str, Any]]] = []
@@ -727,6 +731,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 representative_rows = reps
             if review_snapshots[0] != review_snapshots[1]:
                 raise RuntimeError("graphql_snapshot_unstable")
+            review_snapshot_at = datetime.now(UTC).replace(microsecond=0)
             if representative_rows:
                 hydrated = client.graphql(HYDRATE_QUERY, {"ids": [pr_id for pr_id, _ in representative_rows]}).get("nodes")
                 by_id = _ordered_node_map(hydrated, [pr_id for pr_id, _ in representative_rows])
@@ -747,8 +752,8 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 set_status(member.member_id, "prs_reviewed", "complete", None, observed_at)
         except Exception as exc:
             reason = _exception_reason(exc, "graphql_partial_response")
-            proof = (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
-            set_status(member.member_id, "prs_reviewed", "partial", reason, proof_override=proof)
+            proof = (True, None, True, False) if review_snapshot_at is not None else (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
+            set_status(member.member_id, "prs_reviewed", "partial", reason, finished=review_snapshot_at, proof_override=proof)
 
         # Commit context is optional, but a complete day-aligned empty result is
         # distinct from unavailable context. The outer API has no totalCount, so
