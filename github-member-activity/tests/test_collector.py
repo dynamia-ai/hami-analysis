@@ -202,6 +202,20 @@ class ReviewBotAndUserGitHub(EmptyGitHub):
         return super().graphql(query, variables)
 
 
+class ReviewBotAndInvalidTargetGitHub(ReviewBotAndUserGitHub):
+    def __init__(self, state, submitted):
+        self.state = state
+        self.submitted = submitted
+
+    def connection(self, query, variables, path):
+        if path == ("node", "reviews"):
+            return [
+                {"__typename": "PullRequestReview", "id": "BOT1", "author": {"__typename": "Bot", "id": "B1"}, "state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"},
+                {"__typename": "PullRequestReview", "id": "RV1", "author": {"__typename": "User", "id": "U_1"}, "state": self.state, "submittedAt": self.submitted},
+            ]
+        return super().connection(query, variables, path)
+
+
 class CommitPartitionGitHub:
     def __init__(self, *, always_next=False, terminal_count=1):
         self.calls = []
@@ -474,6 +488,14 @@ def test_review_ignores_bot_reviews_and_counts_target_user_review():
     row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
     assert row.status == "complete"
     assert [event.event_node_id for event in result.events if event.event_kind == "pr_reviewed"] == ["RV1"]
+
+
+@pytest.mark.parametrize(("state", "submitted"), [("PENDING", None), ("APPROVED", "2025-12-31T23:59:59Z")])
+def test_review_target_without_eligible_submitted_review_fails_explicitly(state, submitted):
+    config, period = _proof_fixture()
+    result = collect(config, period, ReviewBotAndInvalidTargetGitHub(state, submitted), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
+    assert (row.status, row.reason) == ("failed", "api_contract_violation")
 
 
 def test_repository_gate_uses_repository_subject_directly():

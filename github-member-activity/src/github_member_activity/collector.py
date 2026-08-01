@@ -727,14 +727,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 for pr_id in sorted(pr_ids):
                     reviews = client.connection(REVIEWS_QUERY, {"id": pr_id}, ("node", "reviews"))
                     eligible_reviews: list[dict[str, Any]] = []
-                    target_review_seen = False
                     for review in reviews:
                         if not isinstance(review, dict) or review.get("__typename") != "PullRequestReview" or not isinstance(review.get("id"), str) or not review.get("id"):
                             raise RuntimeError("api_contract_violation")
                         author = review.get("author")
                         if not isinstance(author, dict) or author.get("__typename") != "User" or author.get("id") != member.github_node_id:
                             continue
-                        target_review_seen = True
                         state = review.get("state")
                         submitted = review.get("submittedAt")
                         if state == "PENDING":
@@ -746,7 +744,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         parsed = parse_rfc3339(submitted)
                         if start.astimezone(UTC) <= parsed < end.astimezone(UTC):
                             eligible_reviews.append({"id": review.get("id"), "submitted": submitted})
-                    if not target_review_seen:
+                    if not eligible_reviews:
                         raise RuntimeError("api_contract_violation")
                     if eligible_reviews:
                         reps.append((pr_id, min(eligible_reviews, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
