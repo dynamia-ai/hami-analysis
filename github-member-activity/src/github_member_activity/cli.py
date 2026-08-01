@@ -17,12 +17,16 @@ from .canonical import canonical_json, sha256_bytes, sha256_json
 from .collector import collect, empty_statuses
 from .config import AppConfig, load_config, member_config_sha256, safe_resolved_config, token_for
 from .github_client import GitHubClient
-from .manifest import ARTIFACTS, ARTIFACT_FILES, digest_file, ledger_text, run_id, source_status_object, source_summary, verify_directory, write_diagnostic, write_published
+from .manifest import ARTIFACTS, ARTIFACT_FILES, VALIDATOR_REASONS, digest_file, ledger_text, run_id, source_status_object, source_summary, verify_directory, write_diagnostic, write_published
 from .metrics import aggregate
 from .period import build_period, effective_window, format_z, validate_local_date
 from .renderers import render_csv, render_markdown, render_summary, write_json
 
-app = typer.Typer(add_completion=False, no_args_is_help=True)
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=True,
+    help="Public-only GitHub activity collector. Exit codes: 0 publishable, 2 setup/configuration, 3 diagnostic run, 4 integrity/artifact failure.",
+)
 
 
 def _config(path: Path) -> AppConfig:
@@ -168,6 +172,7 @@ def collect_command(
         typer.echo(json.dumps({"members": len(value.members), "period": report_period.to_json(), "sources": 6, "output": value.output.directory}, ensure_ascii=False, sort_keys=True))
         return
     observed = datetime.now(UTC).replace(microsecond=0)
+    validator_reason = "schema_invalid"
     effective = [member for member in value.members if effective_window(report_period, member.active_from, member.active_until)]
     if not effective:
         reason = "no_applicable_members"
@@ -177,6 +182,7 @@ def collect_command(
         statuses = [type(row)(row.member_id, row.source, row.criticality, "not_run", "stability_gap_not_met") if row.status != "not_applicable" else row for row in empty_statuses(value, report_period, observed_at=observed)]
     else:
         result = None
+        phase = "collect"
         try:
             token = token_for(value)
         except ValueError as exc:
@@ -188,6 +194,7 @@ def collect_command(
             statuses = result.statuses
             reason = "core_source_incomplete" if any(row.criticality == "core" and row.status != "complete" for row in statuses) else None
             if reason is None:
+                phase = "build"
                 status_obj = source_status_object(statuses)
                 resolved = safe_resolved_config(value, result.applied_owner_ids, result.applied_repo_ids)
                 rows = [event.to_dict() for event in result.events]
@@ -212,8 +219,10 @@ def collect_command(
                     "semantic_ledger_sha256": sha256_json(sorted(row["normalized_row_digest"] for row in rows)), "diagnostic_source_status": None,
                 }
                 files = {"resolved-config.json": resolved_bytes, "event-ledger.jsonl": ledger_bytes, "source-status.json": status_bytes, "summary.json": summary_bytes, "summary.csv": csv_bytes, "report.md": report_bytes}
+                phase = "artifact_write"
                 path = write_published(_safe_output_root(config, value.output.directory), report_period.id, rid, files, manifest_base)
                 if receipt_path:
+                    phase = "receipt"
                     try:
                         _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
                     except Exception as receipt_exc:
@@ -228,19 +237,26 @@ def collect_command(
         except typer.Exit:
             raise
         except FileExistsError:
-            reason = "output_conflict"
+            reason = "output_conflict" if phase == "artifact_write" else "artifact_write_failed"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
         except OSError:
-            reason = "artifact_write_failed"
+            reason = "artifact_write_failed" if phase in {"artifact_write", "receipt"} else "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
-        except ValueError:
-            reason = "validation_failed"
+        except ValueError as exc:
+            if phase == "artifact_write":
+                reason = "validation_failed"
+                if str(exc) in VALIDATOR_REASONS:
+                    validator_reason = str(exc)
+            elif phase == "receipt":
+                reason = "artifact_write_failed"
+            else:
+                reason = "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
         except Exception:
-            reason = "run_aborted"
+            reason = "artifact_write_failed" if phase in {"artifact_write", "receipt"} else "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
     rid = run_id(format_z(observed))
@@ -254,7 +270,7 @@ def collect_command(
         "source_status_summary": source_summary(status_obj), "semantic_ledger_sha256": None, "run_status": "diagnostic",
         "run_reason": reason, "publishable": False,
         "artifacts": {key: {"present": False, "sha256": None} for key in ARTIFACTS}, "diagnostic_source_status": status_obj,
-        "validator_result": {"status": "failed", "reason": "schema_invalid"} if reason == "validation_failed" else {"status": "not_run", "reason": None},
+        "validator_result": {"status": "failed", "reason": validator_reason} if reason == "validation_failed" else {"status": "not_run", "reason": None},
     }
     try:
         diagnostics = _safe_output_root(config, "diagnostics")

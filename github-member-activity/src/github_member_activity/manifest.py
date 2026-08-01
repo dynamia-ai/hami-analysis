@@ -210,8 +210,9 @@ def verify_directory(run_dir: Path, *, allow_temp: bool = False) -> tuple[dict[s
     if not isinstance(validator, dict) or set(validator) != {"status", "reason"} or validator.get("status") not in {"passed", "failed", "not_run"} or (validator.get("reason") is not None and validator.get("reason") not in VALIDATOR_REASONS):
         raise ValueError("schema_invalid")
     if manifest.get("run_status") == "diagnostic":
-        expected_validator = {"status": "failed", "reason": "schema_invalid"} if manifest.get("run_reason") == "validation_failed" else {"status": "not_run", "reason": None}
-        if manifest.get("publishable") is not False or manifest.get("run_reason") not in {"stability_gap_not_met", "no_applicable_members", "run_aborted", "core_source_incomplete", "validation_failed", "artifact_write_failed", "output_conflict"} or manifest.get("validator_result") != expected_validator or not isinstance(manifest.get("diagnostic_source_status"), dict):
+        validator_result = manifest.get("validator_result")
+        validator_valid = (validator_result.get("status") == "failed" and validator_result.get("reason") in VALIDATOR_REASONS) if manifest.get("run_reason") == "validation_failed" else validator_result == {"status": "not_run", "reason": None}
+        if manifest.get("publishable") is not False or manifest.get("run_reason") not in {"stability_gap_not_met", "no_applicable_members", "run_aborted", "core_source_incomplete", "validation_failed", "artifact_write_failed", "output_conflict"} or not validator_valid or not isinstance(manifest.get("diagnostic_source_status"), dict):
             raise ValueError("manifest_binding_mismatch")
         if any(manifest.get(field) is not None for field in ("publish_visibility_verified_at", "safe_resolved_config_sha256", "member_config_sha256", "semantic_ledger_sha256")):
             raise ValueError("manifest_binding_mismatch")
@@ -250,6 +251,12 @@ def _validate_diagnostic_state(manifest: dict[str, Any]) -> None:
     for member_rows in by_member.values():
         core_rows = [row for row in member_rows if row["criticality"] == "core"]
         if any(row["status"] == "not_applicable" for row in core_rows) and any(row["status"] != "not_applicable" for row in core_rows):
+            raise ValueError("diagnostic_state_invalid")
+        commit_row = next(row for row in member_rows if row["source"] == "commit_context")
+        if all(row["status"] == "not_applicable" and row["reason"] == "member_window_empty" for row in core_rows):
+            if commit_row["status"] != "not_applicable" or commit_row["reason"] != "member_window_empty":
+                raise ValueError("diagnostic_state_invalid")
+        elif commit_row["status"] == "not_applicable" and commit_row["reason"] == "member_window_empty":
             raise ValueError("diagnostic_state_invalid")
         identity_reasons = {row["reason"] for row in member_rows if row["reason"] in IDENTITY_REASONS}
         if identity_reasons:
@@ -388,6 +395,8 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["status"] in {"partial", "failed", "not_run"} and row["reason"] is None:
             raise ValueError("source_status_invalid")
+        if row["source"] == "commit_context" and row["status"] in {"partial", "failed"} and row["reason"] != "commit_context_unavailable":
+            raise ValueError("source_status_invalid")
         if row["reason"] is not None and row["status"] in STATUS_REASON and row["reason"] not in STATUS_REASON[row["status"]]:
             raise ValueError("source_status_invalid")
         if row["reason"] in {"commit_context_unavailable", "commit_period_not_day_aligned"} and row["source"] != "commit_context":
@@ -437,7 +446,7 @@ def _validate_status(value: dict[str, Any]) -> None:
                 raise ValueError("source_status_invalid")
             if row["source"] in {"issue_replies", "prs_reviewed"} and row["partition_complete"] is not None:
                 raise ValueError("source_status_invalid")
-            if row["visibility_complete"] is True or row["snapshot_complete"] is True:
+            if row["visibility_complete"] is True:
                 raise ValueError("source_status_invalid")
     members = {member for member, _ in seen}
     if len(seen) != len(members) * 6:
@@ -508,7 +517,9 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
         if any(value.hour or value.minute or value.second for value in window):
             if commit_row["status"] != "not_applicable" or commit_row["reason"] != "commit_period_not_day_aligned":
                 raise ValueError("source_status_invalid")
-        elif commit_row["status"] not in {"complete", "not_applicable"}:
+        elif commit_row["status"] == "not_applicable":
+            raise ValueError("source_status_invalid")
+        elif commit_row["status"] not in {"complete", "partial", "failed"}:
             raise ValueError("source_status_invalid")
     if manifest.get("source_status_summary") != source_summary(status):
         raise ValueError("source_status_invalid")
@@ -561,6 +572,8 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
     period_start = parse_rfc3339(manifest["period"]["start_utc"])
     period_end = parse_rfc3339(manifest["period"]["end_utc"])
+    if observed < period_end + timedelta(days=1):
+        raise ValueError("period_invalid")
     member_map = {member["member_id"]: member for member in members}
     zone = resolved_zone
     if manifest["period"]["timezone"] != resolved["timezone"]:
@@ -577,6 +590,18 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
         if not observed <= collected <= verified <= visibility or row["visibility_verified_at"] != manifest["publish_visibility_verified_at"]:
             raise ValueError("ledger_invalid")
         member = member_map[row["member_id"]]
+        window = effective_window(period_value, date.fromisoformat(member["active_from"]), date.fromisoformat(member["active_until"]) if member["active_until"] else None)
+        if window is None:
+            raise ValueError("ledger_invalid")
+        if row["event_kind"] in {"pr_opened", "issue_opened", "pr_merged"}:
+            expected_partition = f"search-{row['source']}-{basic_utc(window[0].astimezone(UTC))}--{basic_utc(window[1].astimezone(UTC))}"
+            if row["query_partition"] != expected_partition:
+                raise ValueError("ledger_invalid")
+        elif row["event_kind"] in {"issue_replied", "pr_reviewed"}:
+            if row["query_partition"] != "root":
+                raise ValueError("ledger_invalid")
+        elif row["query_partition"] != f"commit-root-{window[0].date().isoformat()}--{window[1].date().isoformat()}":
+            raise ValueError("ledger_invalid")
         if row["actor_node_id"] != member["github_node_id"] or row["repo_node_id"] in excluded_repos or row["owner_node_id"] in excluded_owners:
             raise ValueError("ledger_invalid")
         if row["event_kind"] != "commit_day":

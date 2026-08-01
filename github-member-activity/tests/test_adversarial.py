@@ -1,7 +1,7 @@
 import pytest
 
 from github_member_activity.github_client import GitHubClient, GitHubRequestError
-from github_member_activity.manifest import _validate_status, write_diagnostic
+from github_member_activity.manifest import _validate_diagnostic_state, _validate_status, write_diagnostic
 from github_member_activity.models import LedgerEvent, SourceStatus
 
 
@@ -41,6 +41,35 @@ def test_status_matrix_rejects_identity_partial_and_not_run_proofs():
     not_run["rows"][0]["pagination_complete"] = False
     with pytest.raises(ValueError, match="source_status_invalid"):
         _validate_status(not_run)
+
+
+def test_status_matrix_accepts_snapshot_complete_partial_with_visibility_gap():
+    legal = _statuses(failed_source="prs_opened", failed_reason="search_capped")
+    legal["rows"][0].update({
+        "pagination_complete": True,
+        "partition_complete": True,
+        "snapshot_complete": True,
+        "visibility_complete": False,
+        "snapshot_completed_at": "2026-01-02T00:00:00Z",
+    })
+    _validate_status(legal)
+
+    failed = {**legal, "rows": [dict(row) for row in legal["rows"]]}
+    failed["rows"][0]["status"] = "failed"
+    failed["rows"][0]["reason"] = "api_contract_violation"
+    _validate_status(failed)
+
+
+def test_commit_partial_reason_is_canonical_and_member_window_is_six_source_consistent():
+    illegal = _statuses(failed_source="commit_context", failed_reason="pagination_incomplete")
+    with pytest.raises(ValueError, match="source_status_invalid"):
+        _validate_status(illegal)
+
+    valid_member = _statuses()
+    commit_row = valid_member["rows"][-1]
+    commit_row.update({"status": "not_applicable", "reason": "member_window_empty", "pagination_complete": None, "partition_complete": None, "snapshot_complete": None, "visibility_complete": None, "snapshot_completed_at": None})
+    with pytest.raises(ValueError, match="diagnostic_state_invalid"):
+        _validate_diagnostic_state({"run_reason": "core_source_incomplete", "diagnostic_source_status": valid_member})
 
 
 def test_ledger_model_rejects_ordinary_quantity_and_wrong_partition():

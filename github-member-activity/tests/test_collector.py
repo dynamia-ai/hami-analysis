@@ -64,6 +64,14 @@ class DuplicateCommitDayGitHub:
         }]}}}
 
 
+class EmptyCommitGroupGitHub:
+    def graphql(self, query, variables):
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
+            "repository": {"id": "R-empty", "visibility": "PUBLIC", "owner": {"id": "O-empty"}},
+            "contributions": {"totalCount": 0, "edges": [], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+        }]}}}
+
+
 class MultiRepositoryCommitGitHub:
     def graphql(self, query, variables):
         if "nameWithOwner" in query and "commitContributionsByRepository" not in query:
@@ -111,6 +119,11 @@ def test_restricted_commit_contribution_is_not_counted_or_hydrated():
 def test_duplicate_commit_day_fails_before_hydration():
     with pytest.raises(RuntimeError, match="graphql_cardinality_mismatch"):
         _commit_snapshot(DuplicateCommitDayGitHub(), "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
+
+
+def test_empty_commit_group_is_not_accepted_as_complete_zero_context():
+    with pytest.raises(RuntimeError, match="commit_context_unavailable"):
+        _commit_snapshot(EmptyCommitGroupGitHub(), "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
 
 
 def test_multi_repository_commit_connections_page_independently():

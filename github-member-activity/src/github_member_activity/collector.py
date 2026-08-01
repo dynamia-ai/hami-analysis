@@ -46,6 +46,8 @@ def _commit_group_pages(client: GitHubClient, login: str, start_day, end_day) ->
             connection = group.get("contributions") if isinstance(group, dict) else None
             if not isinstance(repo, dict) or not isinstance(repo.get("id"), str) or not repo["id"] or repo["id"] in page_repo_ids or not isinstance(connection, dict) or not isinstance(connection.get("totalCount"), int) or isinstance(connection.get("totalCount"), bool) or connection["totalCount"] < 0 or not isinstance(connection.get("edges"), list) or not isinstance(connection.get("pageInfo"), dict):
                 raise RuntimeError("api_contract_violation")
+            if connection["totalCount"] == 0 and not connection["edges"]:
+                raise RuntimeError("commit_context_unavailable")
             page_repo_ids.add(repo["id"])
             page_info = connection["pageInfo"]
             if not isinstance(page_info.get("hasNextPage"), bool):
