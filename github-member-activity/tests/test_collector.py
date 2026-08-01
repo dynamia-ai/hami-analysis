@@ -3,9 +3,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, collect
+from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, _record_final_gate_failure, collect
 from github_member_activity.config import AppConfig, RepositoryPolicyConfig
 from github_member_activity.github_client import SearchPage
+from github_member_activity.manifest import _validate_status
+from github_member_activity.models import SourceStatus
 from github_member_activity.period import build_period
 
 
@@ -141,6 +143,15 @@ def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
     result = collect(config, period, EmptyGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
     assert all(row.status == "complete" for row in result.statuses if row.criticality == "core")
     assert result.events == []
+
+
+def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_partial():
+    sources = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
+    statuses = [SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-01-02T00:00:00Z") for source in sources]
+    _record_final_gate_failure(statuses, "alice", "issue_replies", "graphql_partial_response")
+    row = next(row for row in statuses if row.source == "issue_replies")
+    assert (row.status, row.pagination_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", True, True, False, "2026-01-02T00:00:00Z")
+    _validate_status({"schema_version": "1.0", "rows": [row.to_dict() for row in statuses]})
 
 
 def test_graphql_actor_author_uses_user_fragment_for_schema_compatibility():

@@ -27,6 +27,34 @@ _NOT_APPLICABLE_REASONS = frozenset({"member_window_empty", "commit_period_not_d
 _NOT_RUN_REASONS = frozenset({"stability_gap_not_met", "run_aborted"})
 
 
+def _canonical_status(status: str, reason: str | None) -> str:
+    if reason in _FAILED_REASONS:
+        return "failed"
+    if reason in _PARTIAL_REASONS:
+        return "partial"
+    if reason in _NOT_APPLICABLE_REASONS:
+        return "not_applicable"
+    if reason in _NOT_RUN_REASONS:
+        return "not_run"
+    return status
+
+
+def _record_final_gate_failure(statuses: list[SourceStatus], member_id: str, source: str, reason: str) -> None:
+    status = _canonical_status("failed", reason)
+    for index, row in enumerate(statuses):
+        if row.member_id != member_id or row.source != source:
+            continue
+        if row.status == "complete":
+            statuses[index] = SourceStatus(
+                row.member_id, row.source, row.criticality, status, reason,
+                row.pagination_complete, row.partition_complete, row.snapshot_complete,
+                False, row.snapshot_completed_at,
+            )
+        else:
+            statuses[index] = SourceStatus(row.member_id, row.source, row.criticality, status, reason)
+        return
+
+
 @dataclass(slots=True)
 class CollectionResult:
     events: list[LedgerEvent]
@@ -359,14 +387,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
     def set_status(member_id: str, source: str, status: str, reason: str | None, finished: datetime | None = None) -> None:
         if reason is not None and reason not in allowed_reasons:
             reason = "api_contract_violation"
-        if reason in _FAILED_REASONS:
-            status = "failed"
-        elif reason in _PARTIAL_REASONS:
-            status = "partial"
-        elif reason in _NOT_APPLICABLE_REASONS:
-            status = "not_applicable"
-        elif reason in _NOT_RUN_REASONS:
-            status = "not_run"
+        status = _canonical_status(status, reason)
         for index, row in enumerate(statuses):
             if row.member_id == member_id and row.source == source:
                 complete = status == "complete"
@@ -781,7 +802,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 reason = getattr(exc, "args", ["visibility_unverified"])[0]
                 for row in list(statuses):
                     if row.status == "complete" and row.member_id == member_id and row.source == source:
-                        set_status(row.member_id, row.source, "failed", reason)
+                        _record_final_gate_failure(statuses, row.member_id, row.source, reason)
         gate_at = datetime.now(UTC).replace(microsecond=0)
         events = [replace(event, visibility_verified_at=format_z(gate_at)) for event in verified_events]
     if gate_at is None:
