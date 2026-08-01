@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +69,14 @@ def _safe_output_root(config_path: Path, relative: str) -> Path:
     return current
 
 
+def _git_commit(config_path: Path) -> str:
+    try:
+        value = subprocess.run(["git", "rev-parse", "HEAD"], cwd=config_path.resolve().parent.parent, check=True, capture_output=True, text=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        value = ""
+    return value if len(value) == 40 and all(char in "0123456789abcdef" for char in value) else "unknown"
+
+
 @app.command("validate-config")
 def validate_config(config: Path = typer.Option(..., "--config", exists=True, dir_okay=False), scheduled: bool = typer.Option(False, "--scheduled")) -> None:
     value = _config(config)
@@ -131,7 +140,7 @@ def collect_command(
                 csv_bytes = csv_value.encode("utf-8")
                 report_bytes = markdown_value.encode("utf-8")
                 manifest_base = {
-                    "schema_version": "1.0", "run_id": rid, "collector": {"version": __version__, "git_commit": "unknown"},
+                    "schema_version": "1.0", "run_id": rid, "collector": {"version": __version__, "git_commit": _git_commit(config)},
                     "github_rest_api_version": value.github.api_version, "period": report_period.to_json(), "observed_at": format_z(observed),
                     "publish_visibility_verified_at": result.publish_visibility_verified_at, "safe_resolved_config_sha256": sha256_bytes(resolved_bytes), "member_config_sha256": member_config_sha256(value),
                     "repository_policy_summary": resolved["repository_policy"], "source_status_summary": status_summary,
@@ -153,7 +162,7 @@ def collect_command(
     status_obj = source_status_object(statuses)
     summary = {"core_complete": False, "optional_complete": False, "noncomplete": []}
     manifest = {
-        "schema_version": "1.0", "run_id": rid, "collector": {"version": __version__, "git_commit": "unknown"},
+        "schema_version": "1.0", "run_id": rid, "collector": {"version": __version__, "git_commit": _git_commit(config)},
         "github_rest_api_version": value.github.api_version, "period": report_period.to_json(), "observed_at": format_z(observed),
         "publish_visibility_verified_at": None, "safe_resolved_config_sha256": None, "member_config_sha256": None,
         "repository_policy_summary": {"public_only": True, "first_party_owners": value.repository_policy.first_party_owners, "applied_public_excluded_owner_ids": [], "applied_public_excluded_repo_ids": []},

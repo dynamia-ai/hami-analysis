@@ -2,7 +2,8 @@ from datetime import date
 
 import pytest
 
-from github_member_activity.config import AppConfig
+from github_member_activity.canonical import sha256_json
+from github_member_activity.config import AppConfig, member_config_sha256, safe_resolved_config
 
 
 def config() -> dict:
@@ -18,6 +19,7 @@ def config() -> dict:
 def test_config_normalizes_first_party_owners():
     value = AppConfig.model_validate(config())
     assert value.repository_policy.first_party_owners == ["dynamia-ai", "project-hami"]
+    assert member_config_sha256(value) == sha256_json(safe_resolved_config(value)["members"])
 
 
 def test_config_rejects_private_mode_and_extra_fields():
