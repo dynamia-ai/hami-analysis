@@ -33,8 +33,6 @@ def _ordered_node_map(nodes: Any, ids: list[str]) -> dict[str, dict[str, Any]]:
 
 
 def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, start: datetime, end: datetime, policy) -> list[dict[str, Any]]:
-    start = start.astimezone(UTC)
-    end = end.astimezone(UTC)
     start_day = start.date()
     end_day = (end - timedelta(seconds=1)).date()
     if end_day < start_day:
@@ -573,16 +571,14 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         # Commit context is optional, but a complete day-aligned empty result is
         # distinct from unavailable context. The outer API has no totalCount, so
         # exactly 100 groups is conservatively downgraded.
-        commit_start = start.astimezone(UTC)
-        commit_end = end.astimezone(UTC)
-        if commit_start.hour or commit_start.minute or commit_start.second or commit_end.hour or commit_end.minute or commit_end.second:
+        if start.hour or start.minute or start.second or end.hour or end.minute or end.second:
             set_status(member.member_id, "commit_context", "not_applicable", "commit_period_not_day_aligned")
         else:
             try:
                 commit_snapshots: list[tuple[tuple[str, str, int], ...]] = []
                 last_commit_rows: list[dict[str, Any]] = []
                 for _ in range(2):
-                    current = _commit_snapshot(client, member.github_login, member.github_node_id, commit_start, commit_end, policy)
+                    current = _commit_snapshot(client, member.github_login, member.github_node_id, start, end, policy)
                     digest = tuple(sorted((item["repo"].node_id, item["day"], item["quantity"]) for item in current))
                     commit_snapshots.append(digest)
                     last_commit_rows = current
@@ -592,7 +588,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 for item in last_commit_rows:
                     metadata = item["repo"]
                     next_day = (datetime.fromisoformat(item["day"]) + timedelta(days=1)).date().isoformat()
-                    events.append(LedgerEvent(member.member_id, member.github_node_id, "commit_day", None, metadata.node_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), None, item["day"], item["quantity"], format_z(finished), format_z(finished), f"commit-root-{commit_start.date().isoformat()}--{commit_end.date().isoformat()}", f"https://github.com/{metadata.full_name}/commits?author={member.github_login}&since={item['day']}T00%3A00%3A00Z&until={next_day}T00%3A00%3A00Z"))
+                    events.append(LedgerEvent(member.member_id, member.github_node_id, "commit_day", None, metadata.node_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), None, item["day"], item["quantity"], format_z(finished), format_z(finished), f"commit-root-{start.date().isoformat()}--{end.date().isoformat()}", f"https://github.com/{metadata.full_name}/commits?author={member.github_login}&since={item['day']}T00%3A00%3A00Z&until={next_day}T00%3A00%3A00Z"))
                 set_status(member.member_id, "commit_context", "complete", None, finished)
             except Exception as exc:
                 set_status(member.member_id, "commit_context", "partial", "commit_context_unavailable")

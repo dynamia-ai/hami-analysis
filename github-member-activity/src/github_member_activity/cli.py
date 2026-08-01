@@ -143,6 +143,7 @@ def collect_command(
         reason = "stability_gap_not_met"
         statuses = [type(row)(row.member_id, row.source, row.criticality, "not_run", "stability_gap_not_met") if row.status != "not_applicable" else row for row in empty_statuses(value, report_period, observed_at=observed)]
     else:
+        result = None
         try:
             token = token_for(value)
         except ValueError as exc:
@@ -185,16 +186,20 @@ def collect_command(
                 return
         except FileExistsError:
             reason = "output_conflict"
-            statuses = empty_statuses(value, report_period, observed_at=observed)
+            if result is None:
+                statuses = empty_statuses(value, report_period, observed_at=observed)
         except OSError:
             reason = "artifact_write_failed"
-            statuses = empty_statuses(value, report_period, observed_at=observed)
+            if result is None:
+                statuses = empty_statuses(value, report_period, observed_at=observed)
         except ValueError:
             reason = "validation_failed"
-            statuses = empty_statuses(value, report_period, observed_at=observed)
+            if result is None:
+                statuses = empty_statuses(value, report_period, observed_at=observed)
         except Exception:
             reason = "run_aborted"
-            statuses = empty_statuses(value, report_period, observed_at=observed)
+            if result is None:
+                statuses = empty_statuses(value, report_period, observed_at=observed)
     rid = run_id(format_z(observed))
     status_obj = source_status_object(statuses)
     summary = {"core_complete": False, "optional_complete": False, "noncomplete": []}

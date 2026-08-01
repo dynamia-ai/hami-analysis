@@ -211,9 +211,6 @@ def _validate_diagnostic_state(manifest: dict[str, Any]) -> None:
         raise ValueError("diagnostic_state_invalid")
     if reason == "run_aborted" and not any(row["reason"] == "run_aborted" for row in rows):
         raise ValueError("diagnostic_state_invalid")
-    if reason in {"artifact_write_failed", "output_conflict", "validation_failed"}:
-        if any(row["status"] not in {"not_run", "not_applicable"} or (row["status"] == "not_run" and row["reason"] != "run_aborted") for row in rows):
-            raise ValueError("diagnostic_state_invalid")
 
 
 def _validate_manifest_header(manifest: dict[str, Any]) -> None:

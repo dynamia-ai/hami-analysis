@@ -89,7 +89,7 @@ jobs:
             echo "exit_code=$([ "$collector_code" = 2 ] && echo 2 || echo 4)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          receipt_values="$(python - <<'PY'
+          receipt_values="$(uv run python - <<'PY'
           import json, os, pathlib, re, sys
           from github_member_activity.canonical import canonical_bytes
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'github-member-activity-receipt.json'

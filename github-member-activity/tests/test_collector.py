@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, date
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -57,6 +58,13 @@ def test_commit_aggregate_edge_accepts_total_commit_count_not_edge_count():
     client = CommitPartitionGitHub(terminal_count=5)
     rows = _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
     assert [(row["repo"].node_id, row["quantity"]) for row in rows] == [("R1", 5)]
+
+
+def test_commit_envelope_uses_effective_local_dates_for_non_utc_zone():
+    client = CommitPartitionGitHub()
+    _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=ZoneInfo("Asia/Shanghai")), datetime(2026, 1, 3, tzinfo=ZoneInfo("Asia/Shanghai")), RepositoryPolicyConfig())
+    assert client.calls[0]["from"] == "2026-01-01T00:00:00Z"
+    assert client.calls[0]["to"] == "2026-01-02T23:59:59Z"
 
 
 def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
