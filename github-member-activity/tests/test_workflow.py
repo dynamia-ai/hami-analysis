@@ -98,3 +98,14 @@ def test_production_wrapper_executes_setup_and_receipt_fail_closed_paths(tmp_pat
     assert "collector_exit_code=3" in output
     assert "artifact_ready=false" in output
     assert "exit_code=4" in output
+
+    (fake_bin / "rm").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    (fake_bin / "rm").chmod(0o755)
+    stale_env = {**no_config_env, "RUNNER_TEMP": str(tmp_path / "runner-3"), "GITHUB_OUTPUT": str(tmp_path / "out-3")}
+    Path(stale_env["RUNNER_TEMP"]).mkdir()
+    Path(stale_env["RUNNER_TEMP"]).joinpath("github-member-activity-receipt.json").write_text("stale\n", encoding="utf-8")
+    result = subprocess.run([str(wrapper)], cwd=root, env=stale_env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0
+    output = Path(stale_env["GITHUB_OUTPUT"]).read_text()
+    assert "artifact_ready=false" in output
+    assert "exit_code=4" in output

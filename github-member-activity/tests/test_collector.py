@@ -24,6 +24,19 @@ class EmptyGitHub:
         return []
 
 
+class SearchActorMismatchGitHub:
+    def graphql(self, query, variables):
+        if "user(login" in query:
+            return {"user": {"__typename": "User", "id": "U_1", "login": "Alice"}}
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": []}}}
+
+    def search(self, query, *, page=1):
+        return SearchPage(({"node_id": "N1", "actor_node_id": "OTHER", "created_at": "2026-01-02T00:00:00Z"},), 1, False)
+
+    def connection(self, query, variables, path):
+        return []
+
+
 class CommitPartitionGitHub:
     def __init__(self, *, always_next=False, terminal_count=1):
         self.calls = []
@@ -143,6 +156,19 @@ def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
     result = collect(config, period, EmptyGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
     assert all(row.status == "complete" for row in result.statuses if row.criticality == "core")
     assert result.events == []
+
+
+def test_search_actor_mismatch_is_failed_conflict_not_partial_snapshot():
+    config = AppConfig.model_validate({
+        "github": {"token_env": "PUBLIC_GITHUB_TOKEN"}, "period": {"timezone": "UTC"},
+        "members": [{"member_id": "alice", "github_login": "Alice", "github_node_id": "U_1", "active_from": date(2020, 1, 1)}],
+        "repository_policy": {"public_only": True, "first_party_owners": []}, "output": {"directory": "./output"},
+    })
+    period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-08T00:00:00Z")
+    result = collect(config, period, SearchActorMismatchGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        assert (rows[source].status, rows[source].reason) == ("failed", "search_candidate_conflict")
 
 
 def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_partial():

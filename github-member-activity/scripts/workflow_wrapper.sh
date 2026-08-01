@@ -18,7 +18,10 @@ if [ -e "$receipt" ] || [ -L "$receipt" ]; then
     echo "unsafe stale receipt" >&2
     stop_with 4
   fi
-  rm -- "$receipt"
+  if ! rm -- "$receipt" || [ -e "$receipt" ] || [ -L "$receipt" ]; then
+    echo "stale receipt could not be removed" >&2
+    stop_with 4
+  fi
 fi
 
 if [ ! -f ./config.yaml ]; then
