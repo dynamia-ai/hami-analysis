@@ -465,7 +465,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     raise RuntimeError("search_candidate_conflict")
                 candidate_rows[source] = (kind, time_field, candidates)
             except Exception as exc:
-                set_status(member.member_id, source, "partial", _exception_reason(exc, "search_snapshot_unstable"))
+                reason = _exception_reason(exc, "search_snapshot_unstable")
+                proof = (True, True, False, None) if reason == "search_snapshot_unstable" else None
+                set_status(member.member_id, source, "partial", reason, proof_override=proof)
 
         all_candidates = [(source, kind, time_field, candidate) for source, (kind, time_field, candidates) in candidate_rows.items() for candidate in candidates]
         rest_ready = True
@@ -662,7 +664,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 events.append(LedgerEvent(member.member_id, member.github_node_id, "issue_replied", str(item["id"]), item["issue_id"], metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), format_z(parse_rfc3339(item["created"])), None, 1, format_z(finished), format_z(finished), "root", f"https://github.com/{metadata.full_name}/issues/{item['issue_number']}"))
             set_status(member.member_id, "issue_replies", "complete", None, finished)
         except Exception as exc:
-            set_status(member.member_id, "issue_replies", "partial", _exception_reason(exc, "graphql_partial_response"))
+            reason = _exception_reason(exc, "graphql_partial_response")
+            proof = (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
+            set_status(member.member_id, "issue_replies", "partial", reason, proof_override=proof)
 
         # Reviews use contribution nodes only to discover target PRs. The PR's
         # complete reviews connection supplies the canonical submittedAt event.
@@ -742,7 +746,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             else:
                 set_status(member.member_id, "prs_reviewed", "complete", None, observed_at)
         except Exception as exc:
-            set_status(member.member_id, "prs_reviewed", "partial", _exception_reason(exc, "graphql_partial_response"))
+            reason = _exception_reason(exc, "graphql_partial_response")
+            proof = (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
+            set_status(member.member_id, "prs_reviewed", "partial", reason, proof_override=proof)
 
         # Commit context is optional, but a complete day-aligned empty result is
         # distinct from unavailable context. The outer API has no totalCount, so

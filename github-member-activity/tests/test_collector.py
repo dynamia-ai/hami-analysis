@@ -37,6 +37,16 @@ class SearchActorMismatchGitHub:
         return []
 
 
+class SearchSnapshotChangingGitHub(SearchActorMismatchGitHub):
+    def __init__(self):
+        self.search_calls = 0
+
+    def search(self, query, *, page=1):
+        self.search_calls += 1
+        created_at = "2026-01-02T00:00:00Z" if self.search_calls % 2 else "2026-01-03T00:00:00Z"
+        return SearchPage(({"node_id": "N1", "actor_node_id": "U_1", "created_at": created_at},), 1, False)
+
+
 class EmptyHydrationGitHub:
     def graphql(self, query, variables):
         if "user(login" in query:
@@ -96,6 +106,46 @@ class HydrationCardinalityGitHub(EmptyHydrationGitHub):
             return {"nodes": []}
         if "nodes(ids:$ids)" in query:
             return {"nodes": [_discovery_node()]}
+        return super().graphql(query, variables)
+
+
+class IssueSnapshotChangingGitHub(EmptyHydrationGitHub):
+    def __init__(self):
+        self.issue_connection_calls = 0
+        self.current_created = "2026-01-02T00:00:00Z"
+
+    def connection(self, query, variables, path):
+        if path == ("user", "issueComments"):
+            self.issue_connection_calls += 1
+            self.current_created = "2026-01-02T00:00:00Z" if self.issue_connection_calls == 1 else "2026-01-03T00:00:00Z"
+            return [{"__typename": "IssueComment", "id": "C1", "author": {"__typename": "User", "id": "U_1"}, "createdAt": self.current_created, "updatedAt": self.current_created, "pullRequest": None, "issue": {"id": "I1"}, "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}}]
+        return []
+
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query and "IssueComment" in query:
+            return {"nodes": [{"__typename": "IssueComment", "id": "C1", "author": {"__typename": "User", "id": "U_1"}, "createdAt": self.current_created, "updatedAt": self.current_created, "pullRequest": None, "issue": {"id": "I1"}, "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}}]}
+        if "nodes(ids:$ids)" in query and "Issue" in query:
+            return {"nodes": [{"__typename": "Issue", "id": "I1", "number": 1, "repository": {"id": "R1", "nameWithOwner": "owner/repo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "owner"}}}]}
+        return super().graphql(query, variables)
+
+
+class ReviewSnapshotChangingGitHub(EmptyHydrationGitHub):
+    def __init__(self):
+        self.review_calls = 0
+        self.current_submitted = "2026-01-02T00:00:00Z"
+
+    def connection(self, query, variables, path):
+        if path == ("user", "contributionsCollection", "pullRequestReviewContributions"):
+            return [{"isRestricted": False, "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
+        if path == ("node", "reviews"):
+            self.review_calls += 1
+            self.current_submitted = "2026-01-02T00:00:00Z" if self.review_calls == 1 else "2026-01-03T00:00:00Z"
+            return [{"__typename": "PullRequestReview", "id": "RV1", "author": {"__typename": "User", "id": "U_1"}, "state": "APPROVED", "submittedAt": self.current_submitted}]
+        return []
+
+    def graphql(self, query, variables):
+        if "nodes(ids:$ids)" in query:
+            return {"nodes": [{"__typename": "PullRequest", "id": "P1", "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}}]}
         return super().graphql(query, variables)
 
 
@@ -297,6 +347,15 @@ def test_actor_mismatch_retains_completed_search_proof():
         assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("failed", "search_candidate_conflict", True, True, False, False, None)
 
 
+def test_search_snapshot_mismatch_retains_completed_pagination_proof():
+    config, period = _proof_fixture()
+    result = collect(config, period, SearchSnapshotChangingGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = {row.source: row for row in result.statuses if row.member_id == "alice"}
+    for source in ("prs_opened", "issues_opened", "authored_prs_merged"):
+        row = rows[source]
+        assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", "search_snapshot_unstable", True, True, False, None, None)
+
+
 def test_discovery_snapshot_instability_keeps_visibility_unattempted():
     config, period = _proof_fixture()
     result = collect(config, period, UnstableDiscoveryGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
@@ -324,6 +383,20 @@ def test_hydration_cardinality_failure_retains_stable_snapshot_timestamp():
         row = rows[source]
         assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete) == ("failed", "visibility_unverified", True, True, True, False)
         assert row.snapshot_completed_at is not None
+
+
+def test_issue_snapshot_mismatch_retains_completed_connection_proof():
+    config, period = _proof_fixture()
+    result = collect(config, period, IssueSnapshotChangingGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "issue_replies")
+    assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", "graphql_snapshot_unstable", True, None, False, None, None)
+
+
+def test_review_snapshot_mismatch_retains_completed_connection_proof():
+    config, period = _proof_fixture()
+    result = collect(config, period, ReviewSnapshotChangingGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
+    assert (row.status, row.reason, row.pagination_complete, row.partition_complete, row.snapshot_complete, row.visibility_complete, row.snapshot_completed_at) == ("partial", "graphql_snapshot_unstable", True, None, False, None, None)
 
 
 def test_final_visibility_gate_preserves_completed_source_proof_on_graphql_partial():
