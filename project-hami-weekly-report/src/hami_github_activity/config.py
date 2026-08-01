@@ -13,6 +13,17 @@ class GithubConfig(BaseModel):
 
     org: str = Field(min_length=1)
     token_env: str = Field(min_length=1)
+    expected_repositories: list[str] = Field(min_length=1)
+
+    @field_validator("expected_repositories")
+    @classmethod
+    def valid_expected_repositories(cls, value: list[str]) -> list[str]:
+        normalized = [name.strip() for name in value]
+        if any(not name or name.count("/") != 1 for name in normalized):
+            raise ValueError("expected_repositories entries must use OWNER/REPOSITORY form")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("expected_repositories entries must be unique")
+        return sorted(normalized)
 
 
 class ScanConfig(BaseModel):

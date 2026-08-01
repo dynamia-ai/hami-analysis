@@ -9,7 +9,7 @@ from hami_github_activity.config import load_config, output_path
 def test_load_config_and_resolve_relative_output(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        """github:\n  org: Project-HAMi\n  token_env: GITHUB_TOKEN\nscan:\n  days: 7\n  timezone: Asia/Shanghai\noutput:\n  file: ./output/{org}-{start_date}-{end_date}.md\n""",
+        """github:\n  org: Project-HAMi\n  token_env: GITHUB_TOKEN\n  expected_repositories:\n    - Project-HAMi/HAMi\nscan:\n  days: 7\n  timezone: Asia/Shanghai\noutput:\n  file: ./output/{org}-{start_date}-{end_date}.md\n""",
         encoding="utf-8",
     )
     config = load_config(config_path)
@@ -26,7 +26,7 @@ def test_load_config_and_resolve_relative_output(tmp_path: Path) -> None:
 def test_config_rejects_unknown_options(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(
-        """github:\n  org: Project-HAMi\n  token_env: GITHUB_TOKEN\n  transport: gh\nscan:\n  days: 7\n  timezone: UTC\noutput:\n  file: output.md\n""",
+        """github:\n  org: Project-HAMi\n  token_env: GITHUB_TOKEN\n  expected_repositories:\n    - Project-HAMi/HAMi\n  transport: gh\nscan:\n  days: 7\n  timezone: UTC\noutput:\n  file: output.md\n""",
         encoding="utf-8",
     )
     with pytest.raises(ValidationError, match="transport"):
@@ -43,7 +43,7 @@ def test_output_template_rejects_unknown_or_advanced_placeholders(tmp_path: Path
 def test_config_rejects_non_utc_plus_eight_timezone(tmp_path: Path) -> None:
     path = tmp_path / "config.yaml"
     path.write_text(
-        """github:\n  org: Project-HAMi\n  token_env: GITHUB_TOKEN\nscan:\n  days: 7\n  timezone: UTC\noutput:\n  file: output.md\n""",
+        """github:\n  org: Project-HAMi\n  token_env: GITHUB_TOKEN\n  expected_repositories:\n    - Project-HAMi/HAMi\nscan:\n  days: 7\n  timezone: UTC\noutput:\n  file: output.md\n""",
         encoding="utf-8",
     )
     with pytest.raises(ValidationError, match="Asia/Shanghai"):

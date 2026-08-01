@@ -26,11 +26,23 @@ class ScanPeriod:
 
     @property
     def search_start_date(self) -> str:
-        return self.local_start.date().isoformat()
+        """Return the UTC calendar day used for the broad GitHub Search query.
+
+        GitHub Search's date qualifier is a calendar-day filter, while the report
+        window is an exact UTC interval.  Starting at the UTC day that contains
+        ``utc_start`` deliberately over-collects up to one day; the collector then
+        applies exact event-time filtering.  Using the local UTC+8 date here would
+        miss the first eight hours of every window.
+        """
+        return self.utc_start.date().isoformat()
 
     @property
     def search_end_date(self) -> str:
-        return self.local_end.date().isoformat()
+        # Candidate discovery intentionally has no upper bound.  An item can have
+        # activity in a historical report window and be updated again later; an
+        # upper bound would make that activity undiscoverable.  Keep this property
+        # for backwards-compatible display code only.
+        return self.utc_end.date().isoformat()
 
     def contains(self, value: datetime | None) -> bool:
         if value is None:

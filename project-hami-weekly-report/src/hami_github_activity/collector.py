@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
 from threading import Lock
 from typing import Any
 
@@ -33,12 +34,15 @@ class ActivityCollector:
         self._warnings_lock = Lock()
         self._unexplained_updated_excluded_count = 0
         self._activity_failure_excluded_count = 0
+        self._partial_reasons: list[str] = []
 
     def collect(self, org: str) -> CollectionResult:
+        self.warnings = []
         self._unexplained_updated_excluded_count = 0
         self._activity_failure_excluded_count = 0
-        issue_candidates = self._deduplicate(self._search(org, "issue"))
-        pr_candidates = self._deduplicate(self._search(org, "pr"))
+        self._partial_reasons = []
+        issue_candidates = self._deduplicate(self._search(org, "issue"), kind="issue")
+        pr_candidates = self._deduplicate(self._search(org, "pr"), kind="pr")
         issues: list[IssueEvidence] = []
         pull_requests: list[PullRequestEvidence] = []
 
@@ -71,28 +75,65 @@ class ActivityCollector:
             rate_limit_remaining=self.client.rate_limit_remaining,
             unexplained_updated_excluded_count=self._unexplained_updated_excluded_count,
             activity_failure_excluded_count=self._activity_failure_excluded_count,
+            collection_status="partial" if self._partial_reasons else "complete",
+            partial_reasons=sorted(set(self._partial_reasons)),
         )
 
     def _search(self, org: str, kind: str) -> list[dict[str, Any]]:
-        query = (
-            f"org:{org} is:{kind} "
-            f"updated:{self.period.search_start_date}..{self.period.search_end_date}"
-        )
+        query = f"org:{org} is:{kind} updated:>={self.period.search_start_date}"
         logger.info("Searching GitHub for %s candidates: %s", kind, query)
-        try:
-            result = self.client.search_issues(query)
-        except GitHubRequestError as exc:
-            self._warn(f"search:{kind}", str(exc), exc.url)
-            return []
+        # A failed candidate search makes it impossible to distinguish "no
+        # activity" from an authentication, permission, or API outage.  Propagate
+        # the error so the CLI exits non-zero and does not write success-looking
+        # evidence.
+        result = self.client.search_issues(query)
         if result.capped:
+            message = (
+                f"Search API reported {result.total_count} results; only the first 1000 are available."
+            )
             self._warn(
                 f"search:{kind}",
-                f"Search API reported {result.total_count} results; only the first 1000 are available.",
+                message,
             )
+            self._mark_partial(f"search:{kind}: result cap reached")
         if result.incomplete:
             self._warn(f"search:{kind}", "GitHub Search reported incomplete or partially collected results.")
+            self._mark_partial(f"search:{kind}: incomplete results")
         if result.partial_error:
             self._warn(f"search:{kind}", f"Pagination stopped after partial success: {result.partial_error}", result.partial_error_url)
+            self._mark_partial(f"search:{kind}: pagination error")
+        if result.malformed_item_count:
+            self._warn(
+                f"search:{kind}",
+                "GitHub Search returned "
+                f"{result.malformed_item_count} non-object candidate(s); collection is partial.",
+            )
+            self._mark_partial(f"search:{kind}: malformed response items")
+        if result.malformed_identity_count:
+            self._warn(
+                f"search:{kind}",
+                "GitHub Search returned "
+                f"{result.malformed_identity_count} candidate(s) without a valid repository identity; "
+                "collection is partial.",
+            )
+            self._mark_partial(f"search:{kind}: malformed candidate identity")
+        if result.duplicate_item_count:
+            if result.incomplete:
+                message = (
+                    "GitHub Search returned "
+                    f"{result.duplicate_item_count} duplicate candidate identity value(s), and its "
+                    "candidate set cannot be certified complete."
+                )
+            else:
+                message = (
+                    "GitHub Search returned "
+                    f"{result.duplicate_item_count} duplicate candidate identity value(s) across pages; "
+                    f"{result.unique_item_count} unique candidate(s) reconcile with the terminal total."
+                )
+            self._warn(
+                f"search:{kind}",
+                message,
+            )
         logger.info("Found %d %s candidates", len(result.items), kind)
         return result.items
 
@@ -158,14 +199,27 @@ class ActivityCollector:
         number = candidate.get("number")
         return f"{repository}#{number if isinstance(number, int) else 'unknown'}"
 
-    @staticmethod
-    def _deduplicate(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _deduplicate(self, candidates: list[dict[str, Any]], *, kind: str) -> list[dict[str, Any]]:
+        """Return unique candidates without concealing malformed Search results.
+
+        Search is the discovery boundary for the collection.  Silently dropping a
+        returned object with no actionable identity can turn a broken response
+        into a success-looking zero-result report, so retain the valid entries
+        but make the overall result explicitly partial.
+        """
         unique: dict[tuple[str, int], dict[str, Any]] = {}
-        for item in candidates:
+        for position, item in enumerate(candidates, start=1):
             repository = ActivityCollector._repository_name(item)
             number = item.get("number")
-            if repository and isinstance(number, int):
-                unique[(repository, number)] = item
+            if repository is None or not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                self._warn(
+                    f"search:{kind}",
+                    "Search returned a malformed candidate at position "
+                    f"{position}; repository_url must identify owner/repo and number must be positive.",
+                )
+                self._mark_partial(f"search:{kind}: malformed candidate")
+                continue
+            unique[(repository, number)] = item
         return list(unique.values())
 
     @staticmethod
@@ -174,13 +228,20 @@ class ActivityCollector:
         if not isinstance(url, str):
             return None
         marker = "/repos/"
-        return url.split(marker, 1)[1] if marker in url else None
+        if marker not in url:
+            return None
+        repository = url.split(marker, 1)[1].rstrip("/")
+        owner, separator, name = repository.partition("/")
+        if not separator or not owner or not name or "/" in name or "?" in name or "#" in name:
+            return None
+        return f"{owner}/{name}"
 
     def _collect_issue(self, candidate: dict[str, Any]) -> IssueEvidence | None:
         repository = self._repository_name(candidate)
         number = candidate.get("number")
         if repository is None or not isinstance(number, int):
             self._warn("issue:candidate", "Candidate is missing repository_url or number.")
+            self._mark_partial("issue candidate missing required identity")
             return None
         if self._predates_period(candidate):
             logger.info("Pruned issue %s#%d from Search metadata before detail collection", repository, number)
@@ -194,6 +255,7 @@ class ActivityCollector:
                 detail = self.client.get_json(base)
             except GitHubRequestError as exc:
                 self._warn(f"issue:{repository}#{number}", str(exc), exc.url)
+                self._mark_partial(f"issue:{repository}#{number}: detail request failed")
                 return None
 
         data_gaps = self._missing_fields(detail, ["title", "html_url", "state", "user", "created_at", "updated_at"])
@@ -241,6 +303,7 @@ class ActivityCollector:
         number = candidate.get("number")
         if repository is None or not isinstance(number, int):
             self._warn("pull_request:candidate", "Candidate is missing repository_url or number.")
+            self._mark_partial("pull request candidate missing required identity")
             return None
         if self._predates_period(candidate):
             logger.info("Pruned pull request %s#%d from Search metadata before detail collection", repository, number)
@@ -250,6 +313,7 @@ class ActivityCollector:
             detail = self.client.get_json(base)
         except GitHubRequestError as exc:
             self._warn(f"pull_request:{repository}#{number}", str(exc), exc.url)
+            self._mark_partial(f"pull_request:{repository}#{number}: detail request failed")
             return None
 
         data_gaps = self._missing_fields(detail, ["title", "html_url", "state", "user", "created_at", "updated_at"])
@@ -262,6 +326,14 @@ class ActivityCollector:
         review_comments = self._safe_activities(
             base + "/comments", "review_comment", f"pull_request:{repository}#{number}", data_gaps,
             params=self._since_params(), known_count=detail.get("review_comments"),
+        )
+        head = detail.get("head") if isinstance(detail.get("head"), dict) else {}
+        head_sha = head.get("sha") if isinstance(head.get("sha"), str) else None
+        head_commit_at = self._head_commit_at(
+            repository,
+            number,
+            head_sha,
+            data_gaps,
         )
         created_at = parse_datetime(detail.get("created_at"))
         updated_at = parse_datetime(detail.get("updated_at"))
@@ -308,7 +380,50 @@ class ActivityCollector:
             closed_unmerged_in_period=closed_unmerged_in_period,
             exact_activity_unknown=self.period.contains(updated_at) and not known_activity,
             data_gaps=data_gaps,
+            head_sha=head_sha,
+            head_commit_at=head_commit_at,
+            review_decision=self._review_decision(reviews),
         )
+
+    def _head_commit_at(
+        self,
+        repository: str,
+        number: int,
+        head_sha: str | None,
+        data_gaps: list[str],
+    ) -> datetime | None:
+        if head_sha is None:
+            data_gaps.append("Pull request head SHA was not returned by GitHub.")
+            return None
+        path = f"/repos/{repository}/commits/{head_sha}"
+        try:
+            commit = self.client.get_json(path)
+        except GitHubRequestError as exc:
+            message = f"Could not collect head commit metadata: {exc}"
+            data_gaps.append(message)
+            self._warn(f"pull_request:{repository}#{number}", message, exc.url)
+            self._mark_partial(f"pull_request:{repository}#{number}: head commit request failed")
+            return None
+        metadata = commit.get("commit") if isinstance(commit.get("commit"), dict) else {}
+        author = metadata.get("author") if isinstance(metadata.get("author"), dict) else {}
+        committer = metadata.get("committer") if isinstance(metadata.get("committer"), dict) else {}
+        return parse_datetime(author.get("date") or committer.get("date"))
+
+    @staticmethod
+    def _review_decision(reviews: list[Activity]) -> str | None:
+        latest_by_author: dict[str, Activity] = {}
+        for review in reviews:
+            current = latest_by_author.get(review.author)
+            if current is None or (review.occurred_at or datetime.min.replace(tzinfo=UTC)) > (
+                current.occurred_at or datetime.min.replace(tzinfo=UTC)
+            ):
+                latest_by_author[review.author] = review
+        decisions = [
+            f"{author}:{review.state}"
+            for author, review in sorted(latest_by_author.items())
+            if review.state
+        ]
+        return ", ".join(decisions) if decisions else None
 
     def _safe_activities(
         self,
@@ -325,11 +440,33 @@ class ActivityCollector:
             return []
         logger.info("Collecting %s data for %s", kind, scope)
         try:
-            raw = self.client.get_paginated(path, params=params) if params else self.client.get_paginated(path)
+            paginated = getattr(self.client, "get_paginated_result", None)
+            if callable(paginated):
+                page_result = paginated(path, params=params) if params else paginated(path)
+                raw = page_result.items
+                if page_result.incomplete:
+                    message = (
+                        f"Could not collect page {page_result.failed_page} of {kind} data: "
+                        f"{page_result.partial_error}"
+                    )
+                    data_gaps.append(message)
+                    self._warn(scope, message, page_result.partial_error_url)
+                    self._mark_partial(f"{scope}: {kind} pagination incomplete")
+                if page_result.malformed_item_count:
+                    message = (
+                        f"Could not collect {page_result.malformed_item_count} non-object "
+                        f"{kind} record(s) returned by GitHub."
+                    )
+                    data_gaps.append(message)
+                    self._warn(scope, message)
+                    self._mark_partial(f"{scope}: {kind} pagination malformed response items")
+            else:
+                raw = self.client.get_paginated(path, params=params) if params else self.client.get_paginated(path)
         except GitHubRequestError as exc:
             message = f"Could not collect {kind} data: {exc}"
             data_gaps.append(message)
             self._warn(scope, message, exc.url)
+            self._mark_partial(f"{scope}: {kind} request failed")
             return []
         logger.info("Collected %d %s records for %s", len(raw), kind, scope)
         return [self._activity(item, kind) for item in raw]
@@ -406,3 +543,7 @@ class ActivityCollector:
         with self._warnings_lock:
             self.warnings.append(CollectionWarning(scope=scope, message=message, url=url))
         logger.warning("%s: %s%s", scope, message, f" ({url})" if url else "")
+
+    def _mark_partial(self, reason: str) -> None:
+        with self._warnings_lock:
+            self._partial_reasons.append(reason)

@@ -16,6 +16,8 @@ from hami_github_activity.config import AppConfig, load_config, output_path
 from hami_github_activity.date_range import ScanPeriod, build_scan_period
 from hami_github_activity.github_client import GitHubClient
 from hami_github_activity.markdown_renderer import render_markdown, write_markdown
+from hami_github_activity.models import CollectionWarning
+from hami_github_activity.provenance import capture_worktree_snapshot
 
 
 app = typer.Typer(no_args_is_help=True, help="Collect GitHub evidence for weekly HAMi organization analysis.")
@@ -115,6 +117,52 @@ def _summary(
         typer.echo("Dry run: no GitHub requests were made and no evidence file was written.")
 
 
+def _record_repository_visibility(
+    result: object,
+    *,
+    expected: list[str],
+    repositories: list[dict[str, object]],
+    inventory_incomplete: bool,
+    inventory_malformed_item_count: int = 0,
+) -> None:
+    """Fail closed when token visibility cannot be matched to an explicit scope."""
+    visible: list[str] = []
+    malformed = 0
+    for repository in repositories:
+        name = repository.get("full_name")
+        if isinstance(name, str) and name.count("/") == 1:
+            visible.append(name)
+        else:
+            malformed += 1
+    result.visible_repositories = sorted(set(visible))  # type: ignore[attr-defined]
+    result.expected_repositories = expected  # type: ignore[attr-defined]
+    problems: list[str] = []
+    if inventory_incomplete:
+        problems.append("repository inventory pagination was incomplete")
+    if inventory_malformed_item_count:
+        problems.append(
+            "repository inventory returned "
+            f"{inventory_malformed_item_count} non-object entries"
+        )
+    if malformed:
+        problems.append(f"repository inventory contained {malformed} malformed entries")
+    if not expected:
+        problems.append("expected_repositories is not configured")
+    else:
+        missing = sorted(set(expected) - set(visible))
+        if missing:
+            problems.append("token cannot see expected repositories: " + ", ".join(missing))
+        unexpected = sorted(set(visible) - set(expected))
+        if unexpected:
+            problems.append("repository inventory has unlisted repositories: " + ", ".join(unexpected))
+    if problems:
+        result.collection_status = "partial"  # type: ignore[attr-defined]
+        result.partial_reasons = sorted(set(result.partial_reasons + problems))  # type: ignore[attr-defined]
+        result.warnings.extend(  # type: ignore[attr-defined]
+            CollectionWarning(scope="repository_inventory", message=problem) for problem in problems
+        )
+
+
 @app.command("validate-config")
 def validate_config(
     config: Annotated[Path, typer.Option("--config", exists=True, dir_okay=False, readable=True)],
@@ -168,12 +216,33 @@ def collect(
             workers,
             requests_per_second,
         )
+        started_worktree = capture_worktree_snapshot(Path(__file__).resolve().parent)
         with GitHubClient(
             token,
             max_connections=workers,
             requests_per_second=requests_per_second,
         ) as client:
+            inventory = client.list_org_repositories(loaded.github.org)
             result = ActivityCollector(client, period, workers=workers).collect(loaded.github.org)
+        result.collector_started_worktree = started_worktree
+        _record_repository_visibility(
+            result,
+            expected=loaded.github.expected_repositories,
+            repositories=inventory.items,
+            inventory_incomplete=inventory.incomplete,
+            inventory_malformed_item_count=inventory.malformed_item_count,
+        )
+        if started_worktree is None:
+            result.collection_status = "partial"
+            result.partial_reasons = sorted(
+                set(result.partial_reasons + ["collector worktree snapshot could not be captured at collection start"])
+            )
+            result.warnings.append(
+                CollectionWarning(
+                    scope="collector_provenance",
+                    message="collector worktree snapshot could not be captured at collection start",
+                )
+            )
         logger.info("Rendering Markdown evidence")
         content = render_markdown(org=loaded.github.org, period=period, result=result)
         logger.info("Writing evidence file: %s", evidence_path)

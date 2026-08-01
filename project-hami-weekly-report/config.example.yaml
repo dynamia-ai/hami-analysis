@@ -1,6 +1,31 @@
 github:
   org: Project-HAMi
   token_env: GITHUB_TOKEN
+  # 正式采集必须穷举预期可见的仓库；漏列会削弱 token 可见性校验。
+  expected_repositories:
+    - Project-HAMi/.project
+    - Project-HAMi/HAMi
+    - Project-HAMi/HAMi-DRA
+    - Project-HAMi/HAMi-WebUI
+    - Project-HAMi/HAMi-core
+    - Project-HAMi/KAI-resource-isolator
+    - Project-HAMi/ai-benchmark
+    - Project-HAMi/amd-device-plugin
+    - Project-HAMi/ascend-device-plugin
+    - Project-HAMi/biren-device-plugin
+    - Project-HAMi/community
+    - Project-HAMi/dcu-dcgm
+    - Project-HAMi/dcu-exporter
+    - Project-HAMi/dcu-vgpu-device-plugin
+    - Project-HAMi/enflame-dra-driver
+    - Project-HAMi/hami-vnpu-core
+    - Project-HAMi/hami-workshop
+    - Project-HAMi/k8s-dra-driver
+    - Project-HAMi/kubecon-demo
+    - Project-HAMi/mock-device-plugin
+    - Project-HAMi/vastai-device-plugin
+    - Project-HAMi/volcano-vgpu-device-plugin
+    - Project-HAMi/website
 
 scan:
   # 最近 7 个自然日，包括运行当天。
