@@ -402,7 +402,7 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["status"] in {"partial", "failed", "not_run"} and row["reason"] is None:
             raise ValueError("source_status_invalid")
-        if row["source"] == "commit_context" and row["status"] in {"partial", "failed"} and row["reason"] != "commit_context_unavailable":
+        if row["source"] == "commit_context" and row["status"] in {"partial", "failed"} and row["reason"] not in {"commit_context_unavailable", *IDENTITY_REASONS}:
             raise ValueError("source_status_invalid")
         if row["reason"] is not None and row["status"] in STATUS_REASON and row["reason"] not in STATUS_REASON[row["status"]]:
             raise ValueError("source_status_invalid")

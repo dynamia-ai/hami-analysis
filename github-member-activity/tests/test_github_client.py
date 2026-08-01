@@ -24,3 +24,13 @@ def test_graphql_duplicate_stable_node_fails():
     client = TwoPageClient([page("c1", {"id": "n1"}, True, "c1"), page("c2", {"id": "n1"}, False, "c2")])
     with pytest.raises(GitHubRequestError):
         client.connection("", {}, ("root",))
+
+
+def test_graphql_cursor_cycle_fails_closed():
+    pages = [
+        {"root": {"totalCount": 3, "edges": [{"cursor": "c1", "node": {"id": "n1"}}], "pageInfo": {"hasNextPage": True, "endCursor": "c2"}}},
+        {"root": {"totalCount": 3, "edges": [{"cursor": "c2", "node": {"id": "n2"}}], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}},
+        {"root": {"totalCount": 3, "edges": [{"cursor": "c3", "node": {"id": "n3"}}], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}},
+    ]
+    with pytest.raises(GitHubRequestError, match="cursor_invalid"):
+        TwoPageClient(pages).connection("", {}, ("root",))

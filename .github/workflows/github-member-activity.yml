@@ -150,29 +150,15 @@ jobs:
           PY
           )" || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
           IFS='|' read -r manifest_status manifest_publishable manifest_reason manifest_validator manifest_validator_reason <<< "$manifest_state"
-          if [ "$collector_code" = 0 ]; then
-            [ "$manifest_status" = 'published' ] && [ "$manifest_publishable" = 'True' ] && [ -z "$manifest_reason" ] && [ "$manifest_validator" = 'passed' ] && [ -z "$manifest_validator_reason" ] || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
-          elif [ "$collector_code" = 3 ]; then
-            [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ] && { [ "$manifest_reason" = 'stability_gap_not_met' ] || [ "$manifest_reason" = 'no_applicable_members' ]; } || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
-          elif [ "$collector_code" = 4 ]; then
-            state_ok=false
-            if [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ -n "$manifest_reason" ] && [ "$manifest_reason" != 'stability_gap_not_met' ] && [ "$manifest_reason" != 'no_applicable_members' ]; then
-              if [ "$manifest_reason" = 'validation_failed' ]; then
-                if [ "$manifest_validator" = 'failed' ]; then
-                  case "$manifest_validator_reason" in
-                    schema_invalid|artifact_binding_mismatch|ledger_invalid|source_status_invalid|aggregate_mismatch|privacy_invariant_failed) state_ok=true ;;
-                  esac
-                fi
-              elif [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ]; then
-                state_ok=true
-              fi
-            fi
-            if [ "$state_ok" != true ]; then
-              echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
-              echo 'exit_code=4' >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          else
+          expected_verify_code=3
+          if [ "$collector_code" = 0 ]; then expected_verify_code=0; fi
+          pre_gate="$(uv run python -m github_member_activity.workflow_gate --collector-code "$collector_code" --receipt-present --manifest-status "$manifest_status" --manifest-publishable "$manifest_publishable" --manifest-reason "$manifest_reason" --validator-status "$manifest_validator" --validator-reason "$manifest_validator_reason" --verify-code "$expected_verify_code")" || {
+            echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
+            echo 'exit_code=4' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          eval "$pre_gate"
+          if [ "$artifact_ready" != true ]; then
             echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
             echo 'exit_code=4' >> "$GITHUB_OUTPUT"
             exit 0
@@ -181,13 +167,13 @@ jobs:
           uv run github-member-activity verify --run-dir "$artifact_path" --expected-manifest-sha256 "$manifest_sha"
           verify_code=$?
           set -e
-          if [ "$collector_code" = 0 ] && [ "$verify_code" = 0 ]; then
-            :
-          elif [ "$collector_code" = 3 ] && [ "$verify_code" = 3 ]; then
-            :
-          elif [ "$collector_code" = 4 ] && [ "$verify_code" = 3 ]; then
-            :
-          else
+          post_gate="$(uv run python -m github_member_activity.workflow_gate --collector-code "$collector_code" --receipt-present --manifest-status "$manifest_status" --manifest-publishable "$manifest_publishable" --manifest-reason "$manifest_reason" --validator-status "$manifest_validator" --validator-reason "$manifest_validator_reason" --verify-code "$verify_code")" || {
+            echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
+            echo 'exit_code=4' >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          eval "$post_gate"
+          if [ "$artifact_ready" != true ]; then
             echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
             echo 'exit_code=4' >> "$GITHUB_OUTPUT"
             exit 0

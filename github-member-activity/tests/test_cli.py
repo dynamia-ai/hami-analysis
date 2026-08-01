@@ -70,6 +70,33 @@ def test_collect_oserror_is_run_aborted_not_artifact_failure(tmp_path, monkeypat
     assert '"run_reason":"run_aborted"' in (diagnostic[0] / "run-manifest.json").read_text(encoding="utf-8")
 
 
+def test_build_oserror_is_artifact_write_failure_and_writes_diagnostic(tmp_path, monkeypatch):
+    config = tmp_path / "config.yaml"
+    config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("PUBLIC_GITHUB_TOKEN", "test-token")
+
+    class NoopClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    statuses = [SourceStatus("example-member", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2099-01-01T00:00:00Z") for source in ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")]
+    monkeypatch.setattr(cli_module, "GitHubClient", NoopClient)
+    monkeypatch.setattr(cli_module, "token_for", lambda value: "test-token")
+    monkeypatch.setattr(cli_module, "collect", lambda *args, **kwargs: CollectionResult([], statuses, [], [], "2026-08-01T00:00:00Z"))
+    monkeypatch.setattr(cli_module, "aggregate", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("build failure")))
+    result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly"])
+    assert result.exit_code == 4
+    diagnostic = list((tmp_path / "diagnostics").iterdir())
+    assert len(diagnostic) == 1
+    assert '"run_reason":"artifact_write_failed"' in (diagnostic[0] / "run-manifest.json").read_text(encoding="utf-8")
+
+
 def test_receipt_failure_stops_before_diagnostic_without_recursive_compensation(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")

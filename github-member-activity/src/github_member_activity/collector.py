@@ -215,8 +215,8 @@ HYDRATE_QUERY = """
 query($ids:[ID!]!) {
   nodes(ids:$ids) {
     __typename id
-    ... on PullRequest { number author { __typename id } createdAt mergedAt repository { id nameWithOwner visibility owner { id login } } }
-    ... on Issue { number author { __typename id } createdAt repository { id nameWithOwner visibility owner { id login } } }
+    ... on PullRequest { number author { __typename ... on User { id } } createdAt mergedAt repository { id nameWithOwner visibility owner { id login } } }
+    ... on Issue { number author { __typename ... on User { id } } createdAt repository { id nameWithOwner visibility owner { id login } } }
   }
 }
 """
@@ -225,8 +225,8 @@ DISCOVERY_QUERY = """
 query($ids:[ID!]!) {
   nodes(ids:$ids) {
     __typename id
-    ... on PullRequest { author { __typename id } createdAt mergedAt repository { id visibility owner { id } } }
-    ... on Issue { author { __typename id } createdAt repository { id visibility owner { id } } }
+    ... on PullRequest { author { __typename ... on User { id } } createdAt mergedAt repository { id visibility owner { id } } }
+    ... on Issue { author { __typename ... on User { id } } createdAt repository { id visibility owner { id } } }
   }
 }
 """
@@ -235,7 +235,7 @@ ISSUE_COMMENTS_QUERY = """
 query($login:String!, $after:String) {
   user(login:$login) {
     issueComments(first:100, after:$after, orderBy:{field:UPDATED_AT, direction:DESC}) {
-      totalCount edges { cursor node { __typename id author { __typename id } createdAt updatedAt pullRequest { id } issue { id } repository { id visibility owner { id } } } }
+      totalCount edges { cursor node { __typename id author { __typename ... on User { id } } createdAt updatedAt pullRequest { id } issue { id } repository { id visibility owner { id } } } }
       pageInfo { hasNextPage endCursor }
     }
   }
@@ -244,8 +244,8 @@ query($login:String!, $after:String) {
 
 ISSUE_COMMENT_DISCOVERY_QUERY = """
 query($ids:[ID!]!) { nodes(ids:$ids) {
-  __typename id
-  ... on IssueComment { author { __typename id } createdAt updatedAt pullRequest { id } issue { id } repository { id visibility owner { id } } }
+__typename id
+  ... on IssueComment { author { __typename ... on User { id } } createdAt updatedAt pullRequest { id } issue { id } repository { id visibility owner { id } } }
 } }
 """
 
@@ -288,7 +288,7 @@ query($id:ID!, $after:String) {
   node(id:$id) {
     ... on PullRequest {
       reviews(first:100, after:$after) {
-        totalCount edges { cursor node { __typename id state submittedAt author { __typename id } } }
+        totalCount edges { cursor node { __typename id state submittedAt author { __typename ... on User { id } } } }
         pageInfo { hasNextPage endCursor }
       }
     }

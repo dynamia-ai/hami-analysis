@@ -224,7 +224,7 @@ def collect_command(
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
         except OSError:
-            reason = "artifact_write_failed" if phase in {"artifact_write", "receipt"} else "run_aborted"
+            reason = "artifact_write_failed" if phase in {"build", "artifact_write", "receipt"} else "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
         except ValueError as exc:
@@ -232,14 +232,14 @@ def collect_command(
                 reason = "validation_failed"
                 if str(exc) in VALIDATOR_REASONS:
                     validator_reason = str(exc)
-            elif phase == "receipt":
+            elif phase in {"build", "receipt"}:
                 reason = "artifact_write_failed"
             else:
                 reason = "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
         except Exception:
-            reason = "artifact_write_failed" if phase in {"artifact_write", "receipt"} else "run_aborted"
+            reason = "artifact_write_failed" if phase in {"build", "artifact_write", "receipt"} else "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
     rid = run_id(format_z(observed))

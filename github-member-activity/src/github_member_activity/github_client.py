@@ -92,10 +92,15 @@ class GitHubClient:
     def connection(self, query: str, variables: dict[str, Any], path: tuple[str, ...]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         cursor: str | None = None
+        requested_cursors: set[str] = set()
         seen_cursors: set[str] = set()
         seen_nodes: set[str] = set()
         expected_total: int | None = None
         while True:
+            if cursor is not None:
+                if cursor in requested_cursors:
+                    raise GitHubRequestError("cursor_invalid")
+                requested_cursors.add(cursor)
             current = dict(variables)
             current["after"] = cursor
             data: Any = self.graphql(query, current)
@@ -133,6 +138,6 @@ class GitHubClient:
                 if expected_total is not None and len(result) != expected_total:
                     raise GitHubRequestError("graphql_cardinality_mismatch")
                 return result
-            if not isinstance(next_cursor, str) or not next_cursor or (cursor is not None and next_cursor == cursor):
+            if not isinstance(next_cursor, str) or not next_cursor or next_cursor in requested_cursors or (cursor is not None and next_cursor == cursor):
                 raise GitHubRequestError("cursor_invalid")
             cursor = next_cursor

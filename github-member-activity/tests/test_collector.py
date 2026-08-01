@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from github_member_activity.collector import _commit_snapshot, collect
+from github_member_activity.collector import DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY, _commit_snapshot, collect
 from github_member_activity.config import AppConfig, RepositoryPolicyConfig
 from github_member_activity.github_client import SearchPage
 from github_member_activity.period import build_period
@@ -141,3 +141,9 @@ def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
     result = collect(config, period, EmptyGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
     assert all(row.status == "complete" for row in result.statuses if row.criticality == "core")
     assert result.events == []
+
+
+def test_graphql_actor_author_uses_user_fragment_for_schema_compatibility():
+    for query in (DISCOVERY_QUERY, HYDRATE_QUERY, ISSUE_COMMENT_DISCOVERY_QUERY, REVIEWS_QUERY):
+        assert "author { __typename id }" not in query
+        assert "... on User { id }" in query

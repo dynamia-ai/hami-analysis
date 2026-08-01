@@ -69,6 +69,10 @@ def test_commit_partial_reason_is_canonical_and_member_window_is_six_source_cons
     illegal = _statuses(failed_source="commit_context", failed_reason="pagination_incomplete")
     with pytest.raises(ValueError, match="source_status_invalid"):
         _validate_status(illegal)
+    identity = _statuses(failed_source="commit_context", failed_reason="identity_resolution_failed")
+    identity["rows"][-1]["status"] = "failed"
+    identity["rows"][-1].update({"pagination_complete": None, "partition_complete": None, "snapshot_complete": None, "visibility_complete": None, "snapshot_completed_at": None})
+    _validate_status(identity)
 
     valid_member = _statuses()
     commit_row = valid_member["rows"][-1]
