@@ -69,14 +69,16 @@ class GitHubClient:
     def search(self, query: str, *, page: int = 1) -> SearchPage:
         response = self._request("GET", "/search/issues", params={"q": query, "sort": "created", "order": "asc", "per_page": 100, "page": page})
         data = response.json()
-        if not isinstance(data, dict) or not isinstance(data.get("items"), list) or not isinstance(data.get("total_count"), int):
+        if not isinstance(data, dict) or not isinstance(data.get("items"), list) or not isinstance(data.get("total_count"), int) or isinstance(data.get("total_count"), bool) or data["total_count"] < 0:
             raise GitHubRequestError("api_contract_violation")
         safe = []
+        if not isinstance(data.get("incomplete_results"), bool):
+            raise GitHubRequestError("api_contract_violation")
         for item in data["items"]:
             if not isinstance(item, dict) or not isinstance(item.get("id"), int) or not isinstance(item.get("node_id"), str) or not isinstance(item.get("created_at"), str) or not isinstance((item.get("user") or {}).get("node_id"), str):
                 raise GitHubRequestError("api_contract_violation")
             safe.append({"id": item["id"], "node_id": item["node_id"], "actor_node_id": item["user"]["node_id"], "created_at": item["created_at"]})
-        return SearchPage(tuple(safe), data["total_count"], bool(data.get("incomplete_results")))
+        return SearchPage(tuple(safe), data["total_count"], data["incomplete_results"])
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         response = self._request("POST", "/graphql", json={"query": query, "variables": variables})
@@ -125,10 +127,12 @@ class GitHubClient:
             next_cursor = info.get("endCursor")
             if not isinstance(has_next, bool):
                 raise GitHubRequestError("api_contract_violation")
+            if next_cursor is not None and not isinstance(next_cursor, str):
+                raise GitHubRequestError("api_contract_violation")
             if not has_next:
                 if expected_total is not None and len(result) != expected_total:
                     raise GitHubRequestError("graphql_cardinality_mismatch")
                 return result
-            if not isinstance(next_cursor, str) or (cursor is not None and next_cursor == cursor):
+            if not isinstance(next_cursor, str) or not next_cursor or (cursor is not None and next_cursor == cursor):
                 raise GitHubRequestError("cursor_invalid")
             cursor = next_cursor

@@ -4,4 +4,4 @@ This package produces replayable, public-only GitHub participation artifacts for
 
 Run locally with `uv run github-member-activity --help`. Collection requires `PUBLIC_GITHUB_TOKEN` (or the configured token environment variable); `--dry-run` and configuration validation never access GitHub.
 
-The scheduled workflow requires a real `config.yaml` containing the approved member login/node-ID list. `config.example.yaml` is schema documentation only and is never used by the workflow; do not replace the member list with placeholder identities.
+The scheduled workflow requires an approved member login/node-ID list supplied as `config.yaml` or the `PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG` secret. `config.example.yaml` is schema documentation only and is never used by the workflow; do not replace the member list with placeholder identities.

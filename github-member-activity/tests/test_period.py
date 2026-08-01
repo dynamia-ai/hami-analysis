@@ -31,3 +31,8 @@ def test_active_until_is_exclusive():
 def test_nonexistent_local_midnight_is_rejected():
     with pytest.raises(ValueError):
         _local_midnight(__import__("datetime").date(2011, 12, 30), ZoneInfo("Pacific/Apia"))
+
+
+def test_ambiguous_local_midnight_is_rejected():
+    with pytest.raises(ValueError):
+        _local_midnight(__import__("datetime").date(1991, 10, 13), ZoneInfo("America/Havana"))

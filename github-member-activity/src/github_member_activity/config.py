@@ -123,7 +123,7 @@ class OutputConfig(BaseModel):
     @classmethod
     def safe_directory(cls, value: str) -> str:
         path = Path(value)
-        if not value or any(ord(char) < 0x20 or ord(char) == 0x7f for char in value) or path.is_absolute() or ".." in path.parts or value.startswith("~"):
+        if not value or any(ord(char) < 0x20 or ord(char) == 0x7f for char in value) or any(not re.fullmatch(r"[A-Za-z0-9._-]+", part) for part in path.parts if part not in {".", ".."}) or path.is_absolute() or ".." in path.parts or value.startswith("~"):
             raise ValueError("output.directory must be a safe relative path")
         return value
 

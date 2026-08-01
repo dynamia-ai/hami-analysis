@@ -22,15 +22,18 @@ class EmptyGitHub:
 
 
 class CommitPartitionGitHub:
-    def __init__(self, *, always_next=False):
+    def __init__(self, *, always_next=False, terminal_count=1):
         self.calls = []
         self.always_next = always_next
+        self.terminal_count = terminal_count
 
     def graphql(self, query, variables):
         self.calls.append(variables)
+        if "nameWithOwner" in query and "commitContributionsByRepository" not in query:
+            return {"nodes": [{"__typename": "Repository", "id": "R1", "nameWithOwner": "dynamia-ai/demo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "dynamia-ai"}}]}
         day = variables["from"][:10]
-        has_next = self.always_next or (day == "2026-01-01" and variables["to"][:10] == "2026-01-03")
-        count = 2 if has_next else 1
+        has_next = self.always_next or (day == "2026-01-01" and variables["to"][:10] == "2026-01-02")
+        count = 2 if has_next else self.terminal_count
         return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
             "repository": {"id": "R1", "nameWithOwner": "dynamia-ai/demo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "dynamia-ai"}},
             "contributions": {"totalCount": count, "edges": [{"cursor": "c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"{day}T12:00:00Z", "commitCount": count, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}}], "pageInfo": {"hasNextPage": has_next, "endCursor": "c1"}},
@@ -41,13 +44,19 @@ def test_commit_inner_connection_is_repartitioned_instead_of_truncated():
     client = CommitPartitionGitHub()
     rows = _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC), RepositoryPolicyConfig())
     assert [(row["repo"].node_id, row["day"]) for row in rows] == [("R1", "2026-01-01"), ("R1", "2026-01-02")]
-    assert len(client.calls) == 3
+    assert len(client.calls) == 5
 
 
 def test_commit_inner_connection_at_one_day_is_unavailable():
     client = CommitPartitionGitHub(always_next=True)
     with pytest.raises(RuntimeError, match="commit_context_unavailable"):
         _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
+
+
+def test_commit_aggregate_edge_accepts_total_commit_count_not_edge_count():
+    client = CommitPartitionGitHub(terminal_count=5)
+    rows = _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
+    assert [(row["repo"].node_id, row["quantity"]) for row in rows] == [("R1", 5)]
 
 
 def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():

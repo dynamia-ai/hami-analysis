@@ -68,11 +68,13 @@ def parse_rfc3339(value: str) -> datetime:
 
 
 def _local_midnight(day: date, zone: ZoneInfo) -> datetime:
-    candidate = datetime.combine(day, time.min, tzinfo=zone)
-    roundtrip = candidate.astimezone(UTC).astimezone(zone)
-    if roundtrip.replace(tzinfo=None) != candidate.replace(tzinfo=None):
+    wall = datetime.combine(day, time.min)
+    candidates = [wall.replace(tzinfo=zone, fold=fold) for fold in (0, 1)]
+    valid = [candidate for candidate in candidates if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == wall]
+    by_offset = {candidate.utcoffset(): candidate for candidate in valid}
+    if len(by_offset) != 1:
         raise ValueError("local midnight is not a valid unique time")
-    return candidate
+    return next(iter(by_offset.values()))
 
 
 def build_period(kind: str, timezone: str, *, now: datetime | None = None, start: str | None = None, end: str | None = None) -> ReportPeriod:

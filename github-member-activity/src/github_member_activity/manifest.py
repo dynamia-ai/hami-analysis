@@ -6,15 +6,15 @@ import os
 import re
 import shutil
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .canonical import canonical_bytes, canonical_json, sha256_bytes, sha256_json
 from .metrics import aggregate
 from .models import LEDGER_FIELDS, SCHEMA_VERSION, SourceStatus
-from .period import parse_rfc3339
+from .period import basic_utc, parse_rfc3339
 from .validation import validate_evidence_url
 
 ARTIFACTS = ("resolved_config", "event_ledger", "source_status", "summary_json", "summary_csv", "report_md")
@@ -53,7 +53,22 @@ def source_summary(status: dict[str, Any]) -> dict[str, Any]:
     return {"core_complete": core_complete, "optional_complete": optional_complete, "noncomplete": noncomplete}
 
 
+def _assert_no_symlink_components(path: Path) -> None:
+    if ".." in path.parts:
+        raise ValueError("unsafe path component")
+    absolute = path.absolute()
+    for component in reversed(absolute.parents):
+        if component.exists() and component.is_symlink():
+            raise ValueError("path escapes through symlink")
+    current = absolute.parent
+    while current != current.parent:
+        if current.is_symlink():
+            raise ValueError("path escapes through symlink")
+        current = current.parent
+
+
 def write_diagnostic(root: Path, manifest: dict[str, Any]) -> Path:
+    _assert_no_symlink_components(root)
     if root.exists() and (root.is_symlink() or not root.is_dir()):
         raise ValueError("unsafe diagnostics root")
     root.mkdir(parents=True, exist_ok=True)
@@ -68,10 +83,13 @@ def write_diagnostic(root: Path, manifest: dict[str, Any]) -> Path:
         (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
         if {path.name for path in temp.iterdir()} != {"run-manifest.json"}:
             raise ValueError("directory_shape_invalid")
-        verify_directory(temp)
+        verify_directory(temp, allow_temp=True)
     except Exception:
         shutil.rmtree(temp)
         raise
+    if target.exists() or target.is_symlink():
+        shutil.rmtree(temp)
+        raise FileExistsError("output_conflict")
     temp.replace(target)
     return target
 
@@ -82,9 +100,14 @@ def write_published(root: Path, period_id: str, rid: str, files: dict[str, bytes
     Callers must provide already validated, public-only bytes. The function never
     overwrites an immutable run directory.
     """
+    _assert_no_symlink_components(root)
+    if not re.fullmatch(r"(?:weekly|monthly)-[0-9]{8}--[0-9]{8}|explicit-[0-9]{8}t[0-9]{6}z--[0-9]{8}t[0-9]{6}z", period_id) or not RUN_ID_RE.fullmatch(rid):
+        raise ValueError("unsafe run path")
     if set(files) != set(ARTIFACT_FILES.values()):
         raise ValueError("artifact set mismatch")
     period_root = root / period_id
+    if period_root.exists() and (period_root.is_symlink() or not period_root.is_dir()):
+        raise ValueError("unsafe period root")
     if root.exists() and (root.is_symlink() or not root.is_dir()):
         raise ValueError("unsafe output root")
     root.mkdir(parents=True, exist_ok=True)
@@ -97,31 +120,38 @@ def write_published(root: Path, period_id: str, rid: str, files: dict[str, bytes
         raise FileExistsError("output_conflict")
     temp.mkdir()
     bindings: dict[str, dict[str, Any]] = {}
-    for key, filename in ARTIFACT_FILES.items():
-        payload = files[filename]
-        path = temp / filename
-        path.write_bytes(payload)
-        bindings[key] = {"present": True, "sha256": digest_file(path)}
-    manifest = dict(manifest_base)
-    manifest["artifacts"] = bindings
-    manifest["run_status"] = "published"
-    manifest["publishable"] = True
-    manifest["run_reason"] = None
-    manifest["validator_result"] = {"status": "passed", "reason": None}
-    (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    try:
+        for key, filename in ARTIFACT_FILES.items():
+            payload = files[filename]
+            path = temp / filename
+            path.write_bytes(payload)
+            bindings[key] = {"present": True, "sha256": digest_file(path)}
+        manifest = dict(manifest_base)
+        manifest["artifacts"] = bindings
+        manifest["run_status"] = "published"
+        manifest["publishable"] = True
+        manifest["run_reason"] = None
+        manifest["validator_result"] = {"status": "passed", "reason": None}
+        (temp / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    except Exception:
+        shutil.rmtree(temp)
+        raise
     if {path.name for path in temp.iterdir()} != {"run-manifest.json", *ARTIFACT_FILES.values()}:
         shutil.rmtree(temp)
         raise ValueError("directory_shape_invalid")
     try:
-        verify_directory(temp)
+        verify_directory(temp, allow_temp=True)
     except Exception:
         shutil.rmtree(temp)
         raise
+    if target.exists() or target.is_symlink():
+        shutil.rmtree(temp)
+        raise FileExistsError("output_conflict")
     temp.replace(target)
     return target
 
 
-def verify_directory(run_dir: Path) -> tuple[dict[str, Any], int]:
+def verify_directory(run_dir: Path, *, allow_temp: bool = False) -> tuple[dict[str, Any], int]:
     if not run_dir.is_dir() or run_dir.is_symlink():
         raise ValueError("invalid run directory")
     manifest_path = run_dir / "run-manifest.json"
@@ -131,7 +161,10 @@ def verify_directory(run_dir: Path) -> tuple[dict[str, Any], int]:
     required = {"schema_version", "run_id", "collector", "github_rest_api_version", "period", "observed_at", "publish_visibility_verified_at", "safe_resolved_config_sha256", "member_config_sha256", "repository_policy_summary", "source_status_summary", "semantic_ledger_sha256", "run_status", "run_reason", "publishable", "artifacts", "diagnostic_source_status", "validator_result"}
     if set(manifest) != required or manifest.get("schema_version") != SCHEMA_VERSION or not isinstance(manifest.get("run_id"), str) or not RUN_ID_RE.fullmatch(manifest["run_id"]):
         raise ValueError("schema_invalid")
+    _validate_manifest_header(manifest)
     expected = {"run-manifest.json"} if manifest.get("run_status") == "diagnostic" else {"run-manifest.json", *ARTIFACT_FILES.values()}
+    if not allow_temp and (run_dir.name != manifest["run_id"] or (manifest.get("run_status") == "published" and run_dir.parent.name != manifest["period"]["id"])):
+        raise ValueError("run_path_binding_mismatch")
     entries = list(run_dir.iterdir())
     if any(path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1 for path in entries):
         raise ValueError("directory_shape_invalid")
@@ -139,11 +172,13 @@ def verify_directory(run_dir: Path) -> tuple[dict[str, Any], int]:
     if names != expected:
         raise ValueError("directory_shape_invalid")
     if manifest.get("run_status") == "diagnostic":
-        if manifest.get("publishable") is not False or manifest.get("run_reason") not in {"stability_gap_not_met", "no_applicable_members", "run_aborted", "core_source_incomplete", "validation_failed", "artifact_write_failed", "output_conflict"} or manifest.get("validator_result") != {"status": "not_run", "reason": None} or not isinstance(manifest.get("diagnostic_source_status"), dict):
+        expected_validator = {"status": "failed", "reason": "validation_failed"} if manifest.get("run_reason") == "validation_failed" else {"status": "not_run", "reason": None}
+        if manifest.get("publishable") is not False or manifest.get("run_reason") not in {"stability_gap_not_met", "no_applicable_members", "run_aborted", "core_source_incomplete", "validation_failed", "artifact_write_failed", "output_conflict"} or manifest.get("validator_result") != expected_validator or not isinstance(manifest.get("diagnostic_source_status"), dict):
             raise ValueError("manifest_binding_mismatch")
         if any(manifest.get(field) is not None for field in ("publish_visibility_verified_at", "safe_resolved_config_sha256", "member_config_sha256", "semantic_ledger_sha256")):
             raise ValueError("manifest_binding_mismatch")
         _validate_status(manifest["diagnostic_source_status"])
+        _validate_diagnostic_state(manifest)
         if manifest.get("source_status_summary") != source_summary(manifest["diagnostic_source_status"]):
             raise ValueError("source_status_invalid")
         artifacts = manifest.get("artifacts")
@@ -165,7 +200,79 @@ def verify_directory(run_dir: Path) -> tuple[dict[str, Any], int]:
     return manifest, 0
 
 
+def _validate_diagnostic_state(manifest: dict[str, Any]) -> None:
+    rows = manifest["diagnostic_source_status"]["rows"]
+    reason = manifest["run_reason"]
+    if reason == "no_applicable_members" and any(row["status"] != "not_applicable" or row["reason"] != "member_window_empty" for row in rows):
+        raise ValueError("diagnostic_state_invalid")
+    if reason == "stability_gap_not_met" and any(row["status"] not in {"not_applicable", "not_run"} or (row["status"] == "not_run" and row["reason"] != "stability_gap_not_met") for row in rows):
+        raise ValueError("diagnostic_state_invalid")
+    if reason == "core_source_incomplete" and not any(row["criticality"] == "core" and row["status"] in {"partial", "failed", "not_run"} for row in rows):
+        raise ValueError("diagnostic_state_invalid")
+    if reason == "run_aborted" and not any(row["reason"] == "run_aborted" for row in rows):
+        raise ValueError("diagnostic_state_invalid")
+    if reason in {"artifact_write_failed", "output_conflict", "validation_failed"}:
+        if any(row["status"] not in {"not_run", "not_applicable"} or (row["status"] == "not_run" and row["reason"] != "run_aborted") for row in rows):
+            raise ValueError("diagnostic_state_invalid")
+
+
+def _validate_manifest_header(manifest: dict[str, Any]) -> None:
+    collector = manifest.get("collector")
+    if not isinstance(collector, dict) or set(collector) != {"version", "git_commit"} or not isinstance(collector["version"], str) or not collector["version"] or not isinstance(collector["git_commit"], str) or not (collector["git_commit"] == "unknown" or re.fullmatch(r"[0-9a-f]{40}", collector["git_commit"])):
+        raise ValueError("schema_invalid")
+    if not isinstance(manifest.get("github_rest_api_version"), str) or not manifest["github_rest_api_version"]:
+        raise ValueError("schema_invalid")
+    if not isinstance(manifest.get("observed_at"), str):
+        raise ValueError("schema_invalid")
+    try:
+        parse_rfc3339(manifest["observed_at"])
+    except ValueError:
+        raise ValueError("schema_invalid") from None
+    period = manifest.get("period")
+    if not isinstance(period, dict) or set(period) != {"id", "timezone", "start_local", "end_local", "start_utc", "end_utc"} or not all(isinstance(period[key], str) and period[key] for key in period):
+        raise ValueError("period_invalid")
+    try:
+        zone = ZoneInfo(period["timezone"])
+        start = parse_rfc3339(period["start_utc"])
+        end = parse_rfc3339(period["end_utc"])
+        local_start = datetime.fromisoformat(period["start_local"])
+        local_end = datetime.fromisoformat(period["end_local"])
+    except (ValueError, TypeError, KeyError):
+        raise ValueError("period_invalid") from None
+    explicit_id = f"explicit-{basic_utc(start)}--{basic_utc(end)}"
+    calendar_id = re.fullmatch(r"(weekly|monthly)-(\d{8})--(\d{8})", period["id"])
+    id_valid = period["id"] == explicit_id or (calendar_id is not None and local_start.strftime("%Y%m%d") == calendar_id.group(2) and local_end.strftime("%Y%m%d") == calendar_id.group(3))
+    calendar_shape = True
+    if calendar_id is not None:
+        if calendar_id.group(1) == "weekly":
+            calendar_shape = local_start.weekday() == 0 and (local_end.date() - local_start.date()).days == 7
+        else:
+            next_month = (local_start.date().replace(day=28) + timedelta(days=4)).replace(day=1)
+            calendar_shape = local_start.day == 1 and local_end.day == 1 and local_end.date() == next_month
+    if end <= start or local_start.tzinfo is None or local_end.tzinfo is None or local_start.microsecond or local_end.microsecond or local_start.astimezone(zone).isoformat() != period["start_local"] or local_end.astimezone(zone).isoformat() != period["end_local"] or not id_valid or not calendar_shape:
+        raise ValueError("period_invalid")
+    policy = manifest.get("repository_policy_summary")
+    if not isinstance(policy, dict) or set(policy) != {"public_only", "first_party_owners", "applied_public_excluded_owner_ids", "applied_public_excluded_repo_ids"} or policy.get("public_only") is not True:
+        raise ValueError("schema_invalid")
+    for key in ("first_party_owners", "applied_public_excluded_owner_ids", "applied_public_excluded_repo_ids"):
+        if not isinstance(policy[key], list) or any(not isinstance(item, str) or not item for item in policy[key]) or policy[key] != sorted(set(policy[key])):
+            raise ValueError("schema_invalid")
+
+
 def _strict_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("invalid JSON") from exc
+    if not raw.endswith(b"\n") or raw[:-1].endswith(b"\n"):
+        raise ValueError("non-canonical JSON framing")
+    value = _strict_json_bytes(raw[:-1])
+    if canonical_bytes(value) + b"\n" != raw:
+        raise ValueError("non-canonical JSON")
+    return value
+
+
+def _strict_json_bytes(raw: bytes) -> dict[str, Any]:
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in items:
@@ -174,11 +281,18 @@ def _strict_json(path: Path) -> dict[str, Any]:
             result[key] = value
         return result
     try:
-        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("invalid JSON") from exc
     if not isinstance(value, dict):
         raise ValueError("JSON root must be object")
+    return value
+
+
+def _strict_json_line(raw: bytes) -> dict[str, Any]:
+    value = _strict_json_bytes(raw)
+    if canonical_bytes(value) != raw:
+        raise ValueError("non-canonical JSON")
     return value
 
 
@@ -193,6 +307,8 @@ def _validate_status(value: dict[str, Any]) -> None:
     for row in value["rows"]:
         if not isinstance(row, dict) or set(row) != allowed:
             raise ValueError("source_status_invalid")
+        if not isinstance(row["member_id"], str) or not row["member_id"] or not isinstance(row["source"], str) or not isinstance(row["criticality"], str) or not isinstance(row["status"], str):
+            raise ValueError("source_status_invalid")
         key = (row["member_id"], row["source"])
         if key in seen or row["source"] not in source_order or row["criticality"] not in {"core", "optional"} or row["status"] not in {"complete", "partial", "failed", "not_applicable", "not_run"}:
             raise ValueError("source_status_invalid")
@@ -205,21 +321,38 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["source"] != "commit_context" and row["criticality"] != "core":
             raise ValueError("source_status_invalid")
-        if row["reason"] is not None and row["reason"] not in reasons:
+        if row["reason"] is not None and (not isinstance(row["reason"], str) or row["reason"] not in reasons):
+            raise ValueError("source_status_invalid")
+        if any(row[field] is not None and not isinstance(row[field], bool) for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete")):
+            raise ValueError("source_status_invalid")
+        if row["status"] in {"partial", "failed", "not_run"} and row["reason"] is None:
             raise ValueError("source_status_invalid")
         if row["status"] == "complete" and not all(row[field] is True for field in ("pagination_complete", "snapshot_complete", "visibility_complete")):
+            raise ValueError("source_status_invalid")
+        if row["status"] == "complete" and row["source"] not in {"issue_replies", "prs_reviewed"} and row["partition_complete"] is not True:
             raise ValueError("source_status_invalid")
         if row["source"] in {"issue_replies", "prs_reviewed"} and row["status"] == "complete" and row["partition_complete"] is not None:
             raise ValueError("source_status_invalid")
         if row["status"] == "not_applicable" and row["reason"] != "member_window_empty" and row["source"] != "commit_context":
             raise ValueError("source_status_invalid")
+        if row["status"] == "not_applicable" and row["source"] == "commit_context" and row["reason"] not in {"member_window_empty", "commit_period_not_day_aligned"}:
+            raise ValueError("source_status_invalid")
         if row["status"] == "complete" and row["reason"] is not None:
+            raise ValueError("source_status_invalid")
+        if row["status"] in {"partial", "failed", "not_run"} and any(row[field] is True for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete")):
             raise ValueError("source_status_invalid")
         if row["source"] == "commit_context" and row["status"] != "complete" and any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at")):
             raise ValueError("source_status_invalid")
         if row["status"] == "not_applicable" and any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at")):
             raise ValueError("source_status_invalid")
         if row["snapshot_complete"] is True and not isinstance(row["snapshot_completed_at"], str):
+            raise ValueError("source_status_invalid")
+        if row["snapshot_complete"] is True:
+            try:
+                parse_rfc3339(row["snapshot_completed_at"])
+            except ValueError:
+                raise ValueError("source_status_invalid") from None
+        if row["snapshot_complete"] is False and row["snapshot_completed_at"] is not None:
             raise ValueError("source_status_invalid")
     members = {member for member, _ in seen}
     if len(seen) != len(members) * 6:
@@ -230,12 +363,38 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
     resolved = _strict_json(run_dir / "resolved-config.json")
     if set(resolved) != {"schema_version", "timezone", "members", "repository_policy"} or resolved["schema_version"] != SCHEMA_VERSION:
         raise ValueError("schema_invalid")
+    try:
+        resolved_zone = ZoneInfo(resolved["timezone"])
+    except (KeyError, TypeError, ZoneInfoNotFoundError):
+        raise ValueError("schema_invalid") from None
     members = resolved["members"]
-    if not isinstance(members, list) or any(set(member) != {"member_id", "github_login", "github_node_id", "active_from", "active_until"} for member in members):
+    if not isinstance(members, list) or any(not isinstance(member, dict) or set(member) != {"member_id", "github_login", "github_node_id", "active_from", "active_until"} for member in members):
+        raise ValueError("schema_invalid")
+    member_ids: set[str] = set()
+    member_logins: set[str] = set()
+    member_nodes: set[str] = set()
+    for member in members:
+        if any(not isinstance(member[key], str) or not member[key] for key in ("member_id", "github_login", "github_node_id", "active_from")) or (member["active_until"] is not None and (not isinstance(member["active_until"], str) or not member["active_until"])):
+            raise ValueError("schema_invalid")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", member["member_id"]) or not re.fullmatch(r"(?!-)[A-Za-z0-9-]{1,39}(?<!-)", member["github_login"]):
+            raise ValueError("schema_invalid")
+        try:
+            active_from = date.fromisoformat(member["active_from"])
+            active_until = date.fromisoformat(member["active_until"]) if member["active_until"] else None
+        except ValueError:
+            raise ValueError("schema_invalid") from None
+        if active_until is not None and active_until <= active_from:
+            raise ValueError("schema_invalid")
+        if member["member_id"] in member_ids or member["github_login"].lower() in member_logins or member["github_node_id"] in member_nodes:
+            raise ValueError("schema_invalid")
+        member_ids.add(member["member_id"]); member_logins.add(member["github_login"].lower()); member_nodes.add(member["github_node_id"])
+    if members != sorted(members, key=lambda member: member["member_id"]):
         raise ValueError("schema_invalid")
     policy = resolved.get("repository_policy")
     if not isinstance(policy, dict) or set(policy) != {"public_only", "first_party_owners", "applied_public_excluded_owner_ids", "applied_public_excluded_repo_ids"} or policy.get("public_only") is not True:
         raise ValueError("schema_invalid")
+    if manifest.get("repository_policy_summary") != policy:
+        raise ValueError("artifact_binding_mismatch")
     status = _strict_json(run_dir / "source-status.json")
     _validate_status(status)
     if len(status["rows"]) != len(members) * 6:
@@ -244,6 +403,8 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
         raise ValueError("source_status_invalid")
     if manifest.get("source_status_summary") != source_summary(status):
         raise ValueError("source_status_invalid")
+    if manifest["source_status_summary"].get("core_complete") is not True:
+        raise ValueError("core_source_incomplete")
     if manifest.get("safe_resolved_config_sha256") != digest_file(run_dir / "resolved-config.json"):
         raise ValueError("artifact_binding_mismatch")
     if manifest.get("member_config_sha256") != sha256_json(members):
@@ -253,11 +414,14 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
     digests: set[str] = set()
     previous_ledger_key: tuple[str, str, str, str, str] | None = None
     ledger_path = run_dir / "event-ledger.jsonl"
-    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+    ledger_raw = ledger_path.read_bytes()
+    if ledger_raw and (not ledger_raw.endswith(b"\n") or ledger_raw[:-1].endswith(b"\n")):
+        raise ValueError("ledger framing invalid")
+    for line in (ledger_raw[:-1].split(b"\n") if ledger_raw else []):
         if not line:
-            continue
+            raise ValueError("ledger framing invalid")
         try:
-            value = json.loads(line, object_pairs_hook=lambda items: dict(items), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+            value = _strict_json_line(line)
             event = __import__("github_member_activity.models", fromlist=["LedgerEvent"]).LedgerEvent.from_dict(value)
             if event.event_key in keys or event.normalized_row_digest in digests:
                 raise ValueError("ledger_invalid")
@@ -267,6 +431,9 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
             validate_evidence_url(event, next(member["github_login"] for member in members if member["member_id"] == event.member_id))
             source_row = next(row for row in status["rows"] if row["member_id"] == event.member_id and row["source"] == event.source)
             if source_row["status"] != "complete":
+                raise ValueError("ledger_invalid")
+            snapshot_at = source_row["snapshot_completed_at"]
+            if not isinstance(snapshot_at, str) or parse_rfc3339(event.collected_at) > parse_rfc3339(snapshot_at):
                 raise ValueError("ledger_invalid")
             ledger_key = (event.member_id, event.event_kind, event.occurred_at or "~", event.contribution_day or "~", event.event_key)
             if previous_ledger_key is not None and ledger_key < previous_ledger_key:
@@ -284,8 +451,13 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
     period_start = parse_rfc3339(manifest["period"]["start_utc"])
     period_end = parse_rfc3339(manifest["period"]["end_utc"])
     member_map = {member["member_id"]: member for member in members}
-    zone = ZoneInfo(resolved["timezone"])
+    zone = resolved_zone
+    if manifest["period"]["timezone"] != resolved["timezone"]:
+        raise ValueError("period_invalid")
     policy = resolved["repository_policy"]
+    for key in ("first_party_owners", "applied_public_excluded_owner_ids", "applied_public_excluded_repo_ids"):
+        if not isinstance(policy[key], list) or any(not isinstance(item, str) or not item for item in policy[key]) or policy[key] != sorted(set(policy[key])):
+            raise ValueError("schema_invalid")
     excluded_repos = set(policy["applied_public_excluded_repo_ids"])
     excluded_owners = set(policy["applied_public_excluded_owner_ids"])
     for row in rows:
@@ -309,7 +481,9 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
             contribution_day = date.fromisoformat(row["contribution_day"])
             local_start = period_start.astimezone(zone).date()
             local_end = period_end.astimezone(zone).date()
-            if not local_start <= contribution_day < local_end:
+            active_start = date.fromisoformat(member["active_from"])
+            active_end = date.fromisoformat(member["active_until"]) if member["active_until"] else None
+            if not local_start <= contribution_day < local_end or contribution_day < active_start or (active_end is not None and contribution_day >= active_end):
                 raise ValueError("ledger_invalid")
     if sha256_json(sorted(digests)) != manifest["semantic_ledger_sha256"]:
         raise ValueError("artifact_binding_mismatch")
@@ -324,7 +498,10 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
         raise ValueError("schema_invalid")
     if summary.get("run_id") != manifest["run_id"] or summary.get("period") != manifest["period"] or summary.get("observed_at") != manifest["observed_at"] or summary.get("publishable") is not True:
         raise ValueError("aggregate_mismatch")
-    logins = {member["member_id"]: member["github_login"] for member in members}
+    applicable_ids = {member["member_id"] for member in members if period_start.astimezone(zone).date() < (date.fromisoformat(member["active_until"]) if member["active_until"] else date.max) and period_end.astimezone(zone).date() > date.fromisoformat(member["active_from"])}
+    if {member["member_id"] for member in summary["members"]} != applicable_ids:
+        raise ValueError("aggregate_mismatch")
+    logins = {member["member_id"]: member["github_login"] for member in members if member["member_id"] in applicable_ids}
     commit_available = {row["member_id"]: row["status"] == "complete" for row in status["rows"] if row["source"] == "commit_context"}
     expected = aggregate([__import__("github_member_activity.models", fromlist=["LedgerEvent"]).LedgerEvent.from_dict(row) for row in rows], list(logins), logins, set(policy["first_party_owners"]), commit_available)
     if summary.get("members") != expected["members"] or summary.get("team") != expected["team"]:

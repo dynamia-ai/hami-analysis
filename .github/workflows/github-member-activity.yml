@@ -36,6 +36,7 @@ jobs:
         name: Collect and verify
         env:
           PUBLIC_GITHUB_TOKEN: ${{ secrets.PUBLIC_GITHUB_TOKEN }}
+          PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG: ${{ secrets.PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG }}
         run: |
           set -u
           receipt="$RUNNER_TEMP/github-member-activity-receipt.json"
@@ -49,10 +50,14 @@ jobs:
             rm -- "$receipt"
           fi
           if [ ! -f ./config.yaml ]; then
-            echo 'production config.yaml is required; config.example.yaml is not an executable schedule configuration' >&2
-            echo 'exit_code=2' >> "$GITHUB_OUTPUT"
-            echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
-            exit 0
+            if [ -z "${PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG:-}" ]; then
+              echo 'production config.yaml or PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG is required; config.example.yaml is not executable' >&2
+              echo 'exit_code=2' >> "$GITHUB_OUTPUT"
+              echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            umask 077
+            printf '%s\n' "$PUBLIC_GITHUB_MEMBER_ACTIVITY_CONFIG" > ./config.yaml
           fi
           set +e
           uv run github-member-activity validate-config --config ./config.yaml --scheduled
@@ -86,9 +91,13 @@ jobs:
           fi
           receipt_values="$(python - <<'PY'
           import json, os, pathlib, re, sys
+          from github_member_activity.canonical import canonical_bytes
           path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'github-member-activity-receipt.json'
           try:
-              value = json.loads(path.read_text(encoding='utf-8'))
+              raw = path.read_bytes()
+              value = json.loads(raw[:-1].decode('utf-8'), object_pairs_hook=lambda pairs: {key: value for key, value in pairs} if len({key for key, _ in pairs}) == len(pairs) else (_ for _ in ()).throw(ValueError()), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+              if not raw.endswith(b'\n') or canonical_bytes(value) + b'\n' != raw:
+                  raise ValueError()
               keys = {'schema_version','period_id','period_utc_slug','run_id','run_dir','manifest_sha256'}
               if set(value) != keys or value['schema_version'] != '1.0' or any(not isinstance(value[key], str) or not value[key] for key in keys):
                   raise ValueError
@@ -100,6 +109,43 @@ jobs:
           PY
           )" || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
           IFS='|' read -r artifact_path manifest_sha period_id period_utc_slug <<< "$receipt_values"
+          manifest_state="$(uv run python - "$artifact_path" "$manifest_sha" "$period_id" "$period_utc_slug" <<'PY'
+          import hashlib, pathlib, sys
+          from github_member_activity.config import load_config
+          from github_member_activity.manifest import verify_directory
+          path = pathlib.Path(sys.argv[1])
+          if path.is_absolute() or not path.parts or '..' in path.parts or any(not part or part in {'.', '..'} for part in path.parts):
+              raise SystemExit(1)
+          config = load_config(pathlib.Path('config.yaml'))
+          published_root = (pathlib.Path.cwd() / config.output.directory).resolve()
+          diagnostic_root = (pathlib.Path.cwd() / 'diagnostics').resolve()
+          resolved_path = path.resolve()
+          manifest, _ = verify_directory(path)
+          root = published_root if manifest['run_status'] == 'published' else diagnostic_root
+          try:
+              resolved_path.relative_to(root)
+          except ValueError:
+              raise SystemExit(1)
+          if any(component.is_symlink() for component in [pathlib.Path(*path.parts[:index]) for index in range(1, len(path.parts) + 1)]):
+              raise SystemExit(1)
+          digest = hashlib.sha256((path / 'run-manifest.json').read_bytes()).hexdigest()
+          if digest != sys.argv[2] or manifest['run_id'] != path.name or manifest['period']['id'] != sys.argv[3] or f"{manifest['period']['start_utc'].replace('-', '').replace(':', '').replace('T', 't').replace('Z', 'z')}--{manifest['period']['end_utc'].replace('-', '').replace(':', '').replace('T', 't').replace('Z', 'z')}" != sys.argv[4]:
+              raise SystemExit(1)
+          print(f"{manifest['run_status']}|{manifest['publishable']}|{manifest['run_reason'] or ''}|{manifest['validator_result']['status']}|{manifest['validator_result']['reason'] or ''}")
+          PY
+          )" || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
+          IFS='|' read -r manifest_status manifest_publishable manifest_reason manifest_validator manifest_validator_reason <<< "$manifest_state"
+          if [ "$collector_code" = 0 ]; then
+            [ "$manifest_status" = 'published' ] && [ "$manifest_publishable" = 'True' ] && [ -z "$manifest_reason" ] && [ "$manifest_validator" = 'passed' ] && [ -z "$manifest_validator_reason" ] || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
+          elif [ "$collector_code" = 3 ]; then
+            [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ] && { [ "$manifest_reason" = 'stability_gap_not_met' ] || [ "$manifest_reason" = 'no_applicable_members' ]; } || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
+          elif [ "$collector_code" = 4 ]; then
+            [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ -n "$manifest_reason" ] && [ "$manifest_reason" != 'stability_gap_not_met' ] && [ "$manifest_reason" != 'no_applicable_members' ] && { [ "$manifest_reason" = 'validation_failed' ] && [ "$manifest_validator" = 'failed' ] && [ "$manifest_validator_reason" = 'validation_failed' ] || { [ "$manifest_reason" != 'validation_failed' ] && [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ]; }; } || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
+          else
+            echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
+            echo 'exit_code=4' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           set +e
           uv run github-member-activity verify --run-dir "$artifact_path" --expected-manifest-sha256 "$manifest_sha"
           verify_code=$?

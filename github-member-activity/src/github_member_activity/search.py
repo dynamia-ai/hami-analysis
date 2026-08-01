@@ -60,7 +60,14 @@ def _collect_once(client: GitHubClient, base: str, start: datetime, end: datetim
     first = client.search(_query(base, start, end), page=1)
     if first.total_count < 1000 and not first.incomplete_results:
         # Reuse the first page through a tiny deterministic adapter.
-        return _leaf(client, base, start, end, first)
+        try:
+            return _leaf(client, base, start, end, first)
+        except GitHubRequestError as exc:
+            if exc.reason != "search_incomplete_results":
+                raise
+            # GitHub can mark a later page incomplete even when page one was
+            # complete. Repartition the whole interval before accepting any
+            # candidate from that unstable leaf.
     midpoint = start + (end - start) // 2
     if midpoint <= start or midpoint >= end:
         raise GitHubRequestError("search_capped")

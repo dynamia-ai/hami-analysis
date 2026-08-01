@@ -40,7 +40,7 @@ def _period(config: AppConfig, kind: str, from_: str | None, to: str | None):
         raise typer.Exit(2) from exc
 
 
-def _write_receipt(path: Path, report_period, rid: str, run_dir: Path) -> None:
+def _validate_receipt_path(path: Path) -> None:
     runner_temp = os.environ.get("RUNNER_TEMP")
     expected = Path(runner_temp).resolve() / "github-member-activity-receipt.json" if runner_temp else None
     if expected is None or path != expected or path.parent != expected.parent:
@@ -48,10 +48,24 @@ def _write_receipt(path: Path, report_period, rid: str, run_dir: Path) -> None:
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
             raise ValueError("receipt target has unsafe type")
+
+
+def _write_receipt(path: Path, report_period, rid: str, run_dir: Path, base_dir: Path) -> None:
+    _validate_receipt_path(path)
+    if path.exists() or path.is_symlink():
         path.unlink()
+    manifest, _ = verify_directory(run_dir)
+    if manifest["run_id"] != rid or manifest["period"]["id"] != report_period.id:
+        raise ValueError("receipt manifest binding mismatch")
+    try:
+        relative_run_dir = run_dir.resolve().relative_to(base_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("receipt run directory escapes configured root") from exc
+    if relative_run_dir.is_absolute() or ".." in relative_run_dir.parts or not relative_run_dir.parts:
+        raise ValueError("receipt run directory is unsafe")
     period_slug = f"{report_period.start_utc:%Y%m%dt%H%M%Sz}--{report_period.end_utc:%Y%m%dt%H%M%Sz}"
     manifest_sha = digest_file(run_dir / "run-manifest.json")
-    receipt = {"schema_version": "1.0", "period_id": report_period.id, "period_utc_slug": period_slug, "run_id": rid, "run_dir": str(run_dir), "manifest_sha256": manifest_sha}
+    receipt = {"schema_version": "1.0", "period_id": report_period.id, "period_utc_slug": period_slug, "run_id": rid, "run_dir": str(relative_run_dir), "manifest_sha256": manifest_sha}
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".github-member-activity-receipt.", delete=False) as stream:
         temp_path = Path(stream.name)
         stream.write(canonical_json(receipt) + "\n")
@@ -84,6 +98,12 @@ def validate_config(config: Path = typer.Option(..., "--config", exists=True, di
     if scheduled and value.period.timezone != "Asia/Shanghai":
         typer.echo("Error: scheduled mode requires Asia/Shanghai", err=True)
         raise typer.Exit(2)
+    try:
+        _safe_output_root(config, value.output.directory)
+        _safe_output_root(config, "diagnostics")
+    except ValueError as exc:
+        typer.echo("Error: configured output path is unsafe", err=True)
+        raise typer.Exit(2) from exc
     typer.echo(f"valid: members={len(value.members)} timezone={value.period.timezone}")
 
 
@@ -101,6 +121,12 @@ def collect_command(
     if (from_ is None) != (to is None) or (from_ and period is not None) or (from_ and scheduled) or (scheduled and dry_run) or (receipt_path and not scheduled) or (not from_ and period is None):
         typer.echo("Error: invalid option combination", err=True)
         raise typer.Exit(2)
+    if receipt_path:
+        try:
+            _validate_receipt_path(receipt_path)
+        except ValueError as exc:
+            typer.echo("Error: receipt path is unsafe", err=True)
+            raise typer.Exit(2) from exc
     if scheduled and value.period.timezone != "Asia/Shanghai":
         typer.echo("Error: scheduled mode requires Asia/Shanghai", err=True)
         raise typer.Exit(2)
@@ -154,7 +180,7 @@ def collect_command(
                 files = {"resolved-config.json": resolved_bytes, "event-ledger.jsonl": ledger_bytes, "source-status.json": status_bytes, "summary.json": summary_bytes, "summary.csv": csv_bytes, "report.md": report_bytes}
                 path = write_published(_safe_output_root(config, value.output.directory), report_period.id, rid, files, manifest_base)
                 if receipt_path:
-                    _write_receipt(receipt_path, report_period, rid, path)
+                    _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
                 typer.echo(f"published: {path}")
                 return
         except FileExistsError:
@@ -180,14 +206,14 @@ def collect_command(
         "source_status_summary": source_summary(status_obj), "semantic_ledger_sha256": None, "run_status": "diagnostic",
         "run_reason": reason, "publishable": False,
         "artifacts": {key: {"present": False, "sha256": None} for key in ARTIFACTS}, "diagnostic_source_status": status_obj,
-        "validator_result": {"status": "not_run", "reason": None},
+        "validator_result": {"status": "failed", "reason": "validation_failed"} if reason == "validation_failed" else {"status": "not_run", "reason": None},
     }
     root = _safe_output_root(config, value.output.directory)
     diagnostics = _safe_output_root(config, "diagnostics")
     path = write_diagnostic(diagnostics, manifest)
     if receipt_path:
         try:
-            _write_receipt(receipt_path, report_period, rid, path)
+            _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
         except ValueError as exc:
             typer.echo("Error: receipt path is unsafe", err=True)
             raise typer.Exit(4) from exc
