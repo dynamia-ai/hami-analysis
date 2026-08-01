@@ -197,3 +197,23 @@ def test_diagnostic_identity_auth_failure_replays_all_six_sources(tmp_path, reas
     assert loaded["diagnostic_source_status"]["rows"]
     assert len(loaded["diagnostic_source_status"]["rows"]) == 6
     assert code == 3
+
+
+def test_diagnostic_allows_optional_commit_repository_binding_failure(tmp_path):
+    path = _committed_diagnostic_fixture(tmp_path)
+    manifest_path = path / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for row in manifest["diagnostic_source_status"]["rows"]:
+        row.update({"status": "failed", "reason": "repository_binding_changed", "pagination_complete": True, "partition_complete": True if row["source"] == "commit_context" else None, "snapshot_complete": True, "visibility_complete": False, "snapshot_completed_at": "2026-08-04T00:00:00Z"})
+        if row["source"] != "commit_context":
+            row["reason"] = "api_contract_violation"
+            row["pagination_complete"] = False
+            row["partition_complete"] = None
+            row["snapshot_complete"] = False
+            row["snapshot_completed_at"] = None
+    manifest["run_reason"] = "core_source_incomplete"
+    manifest["source_status_summary"] = source_summary(manifest["diagnostic_source_status"])
+    manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    loaded, code = verify_directory(path)
+    assert loaded["diagnostic_source_status"]["rows"][-1]["reason"] == "repository_binding_changed"
+    assert code == 3

@@ -402,7 +402,7 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["status"] in {"partial", "failed", "not_run"} and row["reason"] is None:
             raise ValueError("source_status_invalid")
-        if row["source"] == "commit_context" and row["status"] in {"partial", "failed"} and row["reason"] not in {"commit_context_unavailable", *IDENTITY_REASONS}:
+        if row["source"] == "commit_context" and row["status"] in {"partial", "failed"} and row["reason"] not in {"commit_context_unavailable", "repository_binding_changed", *IDENTITY_REASONS}:
             raise ValueError("source_status_invalid")
         if row["reason"] is not None and row["status"] in STATUS_REASON and row["reason"] not in STATUS_REASON[row["status"]]:
             raise ValueError("source_status_invalid")
@@ -446,7 +446,7 @@ def _validate_status(value: dict[str, Any]) -> None:
             raise ValueError("source_status_invalid")
         if row["snapshot_complete"] is True and row["source"] not in {"issue_replies", "prs_reviewed"} and row["partition_complete"] is not True:
             raise ValueError("source_status_invalid")
-        if row["status"] in {"not_applicable", "not_run"} or (row["status"] != "complete" and (row["reason"] in IDENTITY_REASONS or row["source"] == "commit_context")):
+        if row["status"] in {"not_applicable", "not_run"} or (row["status"] != "complete" and (row["reason"] in IDENTITY_REASONS or (row["source"] == "commit_context" and row["reason"] != "repository_binding_changed"))):
             if any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete")):
                 raise ValueError("source_status_invalid")
         elif row["status"] in {"partial", "failed"}:
@@ -488,7 +488,7 @@ def _validate_published_source_status(status: dict[str, Any], members: list[dict
                 raise ValueError("source_status_invalid")
         elif commit_row["status"] == "not_applicable":
             raise ValueError("source_status_invalid")
-        elif commit_row["status"] == "partial" and commit_row["reason"] == "commit_context_unavailable":
+        elif commit_row["status"] in {"partial", "failed"} and commit_row["reason"] in {"commit_context_unavailable", "repository_binding_changed"}:
             pass
         elif commit_row["status"] != "complete":
             raise ValueError("source_status_invalid")
