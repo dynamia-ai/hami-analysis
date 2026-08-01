@@ -21,14 +21,18 @@ from github_member_activity.renderers import render_csv, render_markdown, render
 
 RUN_ID = "20260804t000000z-00000000-0000-4000-8000-000000000000"
 PERIOD = {
-    "id": "weekly-20260727--20260803",
+    "id": "monthly-20260701--20260801" if os.environ.get("FIXTURE_PERIOD_KIND") == "monthly" else "weekly-20260727--20260803",
     "timezone": "Asia/Shanghai",
-    "start_local": "2026-07-27T00:00:00+08:00",
-    "end_local": "2026-08-03T00:00:00+08:00",
-    "start_utc": "2026-07-26T16:00:00Z",
-    "end_utc": "2026-08-02T16:00:00Z",
+    "start_local": "2026-07-01T00:00:00+08:00" if os.environ.get("FIXTURE_PERIOD_KIND") == "monthly" else "2026-07-27T00:00:00+08:00",
+    "end_local": "2026-08-01T00:00:00+08:00" if os.environ.get("FIXTURE_PERIOD_KIND") == "monthly" else "2026-08-03T00:00:00+08:00",
+    "start_utc": "2026-06-30T16:00:00Z" if os.environ.get("FIXTURE_PERIOD_KIND") == "monthly" else "2026-07-26T16:00:00Z",
+    "end_utc": "2026-07-31T16:00:00Z" if os.environ.get("FIXTURE_PERIOD_KIND") == "monthly" else "2026-08-02T16:00:00Z",
 }
 SOURCES = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
+
+
+def _basic_utc(value: str) -> str:
+    return value.replace("-", "").replace(":", "").replace("T", "t").replace("Z", "z")
 
 
 def _statuses(kind: str) -> dict:
@@ -70,7 +74,7 @@ def _published() -> Path:
     event = LedgerEvent(
         "fixture-member", "U_fixture", "pr_opened", "P_fixture", "P_fixture", "R_fixture", "dynamia-ai/fixture", "O_fixture", "dynamia-ai",
         "2026-07-28T12:00:00Z", None, 1, observed, observed,
-        "search-prs_opened-20260726t160000z--20260802t160000z", "https://github.com/dynamia-ai/fixture/pull/1",
+        f"search-prs_opened-{_basic_utc(PERIOD['start_utc'])}--{_basic_utc(PERIOD['end_utc'])}", "https://github.com/dynamia-ai/fixture/pull/1",
     )
     resolved = {"schema_version": "1.0", "timezone": "Asia/Shanghai", "members": [{"member_id": "fixture-member", "github_login": "fixture-login", "github_node_id": "U_fixture", "active_from": "2020-01-01", "active_until": None}], "repository_policy": {"public_only": True, "first_party_owners": ["dynamia-ai"], "applied_public_excluded_owner_ids": [], "applied_public_excluded_repo_ids": []}}
     statuses = source_status_object([SourceStatus("fixture-member", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, observed) for source in SOURCES])
@@ -95,7 +99,9 @@ def _published() -> Path:
 
 def _write_receipt(run_dir: Path, *, mode: str) -> None:
     receipt = Path(os.environ["RUNNER_TEMP"]) / "github-member-activity-receipt.json"
-    value = {"schema_version": "1.0", "period_id": PERIOD["id"], "period_utc_slug": "20260726t160000z--20260802t160000z", "run_id": RUN_ID, "run_dir": str(run_dir.resolve().relative_to(Path.cwd().resolve())), "manifest_sha256": digest_file(run_dir / "run-manifest.json")}
+    def basic(value: str) -> str:
+        return value.replace("-", "").replace(":", "").replace("T", "t").replace("Z", "z")
+    value = {"schema_version": "1.0", "period_id": PERIOD["id"], "period_utc_slug": f"{basic(PERIOD['start_utc'])}--{basic(PERIOD['end_utc'])}", "run_id": RUN_ID, "run_dir": str(run_dir.resolve().relative_to(Path.cwd().resolve())), "manifest_sha256": digest_file(run_dir / "run-manifest.json")}
     if mode == "malformed_receipt":
         receipt.write_text("not-json\n", encoding="utf-8")
         return
@@ -104,7 +110,7 @@ def _write_receipt(run_dir: Path, *, mode: str) -> None:
         receipt.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
         return
     if mode == "receipt_duplicate":
-        receipt.write_text('{"schema_version":"1.0","schema_version":"1.0"}\n', encoding="utf-8")
+        receipt.write_text(canonical_json(value).replace('"schema_version":"1.0"', '"schema_version":"1.0","schema_version":"1.0"', 1) + "\n", encoding="utf-8")
         return
     if mode == "receipt_missing":
         value.pop("run_id")
@@ -145,7 +151,7 @@ def build(mode: str) -> None:
         shutil.copytree(diagnostic, swapped)
         run_dir = swapped
     else:
-        kind = "no_applicable" if mode in {"diagnostic_success", "verify_fail", "malformed_receipt", "wrong_path", "receipt_pretty", "receipt_duplicate", "receipt_missing", "receipt_extra", "receipt_wrong_type", "receipt_wrong_hash", "receipt_wrong_period", "receipt_wrong_run", "receipt_wrong_slug", "receipt_absolute_path", "receipt_dotdot"} else "validation_failed" if mode == "validation_failed" else "run_aborted"
+        kind = "no_applicable" if mode in {"diagnostic_success", "verify_fail", "collector_0_diagnostic", "malformed_receipt", "wrong_path", "receipt_pretty", "receipt_duplicate", "receipt_missing", "receipt_extra", "receipt_wrong_type", "receipt_wrong_hash", "receipt_wrong_period", "receipt_wrong_run", "receipt_wrong_slug", "receipt_absolute_path", "receipt_dotdot"} else "validation_failed" if mode in {"validation_failed", "collector_3_code4_reason"} else "run_aborted"
         run_dir = write_diagnostic(Path("diagnostics"), _diagnostic_manifest(kind)).resolve()
     if mode not in {"collector_2"}:
         _write_receipt(run_dir, mode=mode)

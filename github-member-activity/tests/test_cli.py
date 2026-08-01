@@ -1,7 +1,10 @@
 import subprocess
 from datetime import UTC, datetime
 import json
+import hashlib
+import os
 from pathlib import Path
+import sys
 
 import pytest
 from typer.testing import CliRunner
@@ -11,7 +14,7 @@ from github_member_activity.collector import CollectionResult
 from github_member_activity.cli import _validate_receipt_path, _write_receipt, app
 from github_member_activity.canonical import canonical_json
 from github_member_activity.models import SourceStatus
-from github_member_activity.period import build_period
+from github_member_activity.period import ReportPeriod, build_period
 
 
 RUNNER = CliRunner()
@@ -41,10 +44,37 @@ def test_cli_verify_rejects_invalid_expected_manifest_hash(tmp_path):
     assert result.exit_code == 4
 
 
+def test_cli_verify_rejects_valid_but_wrong_expected_manifest_hash(tmp_path):
+    fixture = Path(__file__).parents[1] / "tests" / "fixtures" / "workflow" / "build_fixture.py"
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src"), "RUNNER_TEMP": str(runner_temp)}
+    subprocess.run([sys.executable, str(fixture), "published"], cwd=tmp_path, env=env, check=True)
+    run_dir = tmp_path / "output" / "weekly-20260727--20260803" / "20260804t000000z-00000000-0000-4000-8000-000000000000"
+    actual = hashlib.sha256((run_dir / "run-manifest.json").read_bytes()).hexdigest()
+    assert RUNNER.invoke(app, ["verify", "--run-dir", str(run_dir), "--expected-manifest-sha256", actual]).exit_code == 0
+    wrong = "0" * 64 if actual != "0" * 64 else "1" * 64
+    assert RUNNER.invoke(app, ["verify", "--run-dir", str(run_dir), "--expected-manifest-sha256", wrong]).exit_code == 4
+
+
 def test_cli_validate_config_scheduled_example():
     result = RUNNER.invoke(app, ["validate-config", "--config", str(EXAMPLE_CONFIG), "--scheduled"])
     assert result.exit_code == 0
     assert "valid: members=1 timezone=Asia/Shanghai" in result.stdout
+
+
+def test_cli_rejects_scheduled_non_asia_shanghai_and_enforces_stability_gap(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8").replace("timezone: Asia/Shanghai", "timezone: UTC"), encoding="utf-8")
+    assert RUNNER.invoke(app, ["validate-config", "--config", str(config), "--scheduled"]).exit_code == 2
+
+    asia_config = tmp_path / "asia-config.yaml"
+    asia_config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    result = RUNNER.invoke(app, ["collect", "--config", str(asia_config), "--from", "2099-01-01T00:00:00Z", "--to", "2099-01-02T00:00:00Z"])
+    assert result.exit_code == 3
+    diagnostics = list((tmp_path / "diagnostics").iterdir())
+    assert len(diagnostics) == 1
+    assert '"run_reason":"stability_gap_not_met"' in (diagnostics[0] / "run-manifest.json").read_text(encoding="utf-8")
 
 
 def test_receipt_path_is_fixed_and_rejects_symlink_or_wrong_directory(tmp_path, monkeypatch):
@@ -194,6 +224,43 @@ def test_receipt_transaction_baseexception_never_publishes_fixed_receipt(tmp_pat
     with pytest.raises(Crash):
         _write_receipt(receipt, period, rid, run_dir, tmp_path)
     assert not receipt.exists()
+
+
+@pytest.mark.parametrize("mode", ["published", "diagnostic_success"])
+def test_receipt_transaction_preserves_real_published_or_diagnostic_authority(tmp_path, monkeypatch, mode):
+    fixture = Path(__file__).parents[1] / "tests" / "fixtures" / "workflow" / "build_fixture.py"
+    case_root = tmp_path / mode
+    runner_temp = case_root / "runner"
+    runner_temp.mkdir(parents=True)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src"), "RUNNER_TEMP": str(runner_temp)}
+    monkeypatch.setenv("RUNNER_TEMP", str(runner_temp))
+    subprocess.run([sys.executable, str(fixture), mode], cwd=case_root, env=env, check=True)
+    run_id = "20260804t000000z-00000000-0000-4000-8000-000000000000"
+    if mode == "published":
+        run_dir = case_root / "output" / "weekly-20260727--20260803" / run_id
+    else:
+        run_dir = case_root / "diagnostics" / run_id
+    manifest = json.loads((run_dir / "run-manifest.json").read_text(encoding="utf-8"))
+    period = ReportPeriod("weekly", "Asia/Shanghai", datetime.fromisoformat(manifest["period"]["start_local"]), datetime.fromisoformat(manifest["period"]["end_local"]))
+    receipt = runner_temp / "github-member-activity-receipt.json"
+    _write_receipt(receipt, period, run_id, run_dir, case_root)
+    assert receipt.is_file()
+    assert cli_module.verify_directory(run_dir)[1] == (0 if mode == "published" else 3)
+    receipt.unlink()
+
+    real_replace = cli_module.os.replace
+
+    def fail_replace(source, target):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(cli_module.os, "replace", fail_replace)
+    with pytest.raises(OSError):
+        _write_receipt(receipt, period, run_id, run_dir, case_root)
+    monkeypatch.setattr(cli_module.os, "replace", real_replace)
+    assert not receipt.exists()
+    assert cli_module.verify_directory(run_dir)[1] == (0 if mode == "published" else 3)
+    authorities = list((case_root / ("output/weekly-20260727--20260803" if mode == "published" else "diagnostics")).glob("*/run-manifest.json"))
+    assert len(authorities) == 1
 
 
 def test_workflow_run_blocks_are_shell_parseable():

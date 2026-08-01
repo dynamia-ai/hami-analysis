@@ -16,9 +16,18 @@ def _committed_published_fixture(tmp_path):
     root = Path(__file__).parents[1]
     fixture = root / "tests" / "fixtures" / "workflow" / "build_fixture.py"
     env = {**os.environ, "PYTHONPATH": str(root / "src"), "RUNNER_TEMP": str(tmp_path / "runner")}
-    Path(env["RUNNER_TEMP"]).mkdir()
+    Path(env["RUNNER_TEMP"]).mkdir(parents=True)
     subprocess.run([sys.executable, str(fixture), "published"], cwd=tmp_path, env=env, check=True)
     return tmp_path / "output" / "weekly-20260727--20260803" / "20260804t000000z-00000000-0000-4000-8000-000000000000"
+
+
+def _committed_diagnostic_fixture(tmp_path):
+    root = Path(__file__).parents[1]
+    fixture = root / "tests" / "fixtures" / "workflow" / "build_fixture.py"
+    env = {**os.environ, "PYTHONPATH": str(root / "src"), "RUNNER_TEMP": str(tmp_path / "runner")}
+    Path(env["RUNNER_TEMP"]).mkdir(parents=True)
+    subprocess.run([sys.executable, str(fixture), "diagnostic_success"], cwd=tmp_path, env=env, check=True)
+    return tmp_path / "diagnostics" / "20260804t000000z-00000000-0000-4000-8000-000000000000"
 
 
 @pytest.mark.parametrize(
@@ -103,11 +112,17 @@ def test_committed_published_artifact_shape_and_boundary_attacks_fail_closed(tmp
     elif shape == "extra_dir":
         (path / "unexpected").mkdir()
     elif shape == "symlink":
-        (path / "unexpected").symlink_to(path / "run-manifest.json")
+        target = path / "summary.json"
+        target.unlink()
+        target.symlink_to(path / "run-manifest.json")
     elif shape == "hardlink":
-        (path / "unexpected").hardlink_to(path / "run-manifest.json")
+        target = path / "summary.json"
+        target.unlink()
+        target.hardlink_to(path / "run-manifest.json")
     elif shape == "fifo":
-        os.mkfifo(path / "unexpected")
+        target = path / "summary.json"
+        target.unlink()
+        os.mkfifo(target)
     else:
         boundary = tmp_path / "diagnostics" / path.name
         boundary.parent.mkdir(parents=True)
@@ -115,3 +130,70 @@ def test_committed_published_artifact_shape_and_boundary_attacks_fail_closed(tmp
         path = boundary
     with pytest.raises(ValueError):
         verify_directory(path)
+
+
+@pytest.mark.parametrize("framing", ["pretty", "double_newline", "duplicate_key"])
+def test_manifest_canonical_framing_attacks_are_isolated(tmp_path, framing):
+    path = _committed_published_fixture(tmp_path)
+    manifest_path = path / "run-manifest.json"
+    raw = manifest_path.read_text(encoding="utf-8")
+    if framing == "pretty":
+        manifest_path.write_text(json.dumps(json.loads(raw), indent=2) + "\n", encoding="utf-8")
+    elif framing == "double_newline":
+        manifest_path.write_text(raw + "\n", encoding="utf-8")
+    else:
+        manifest_path.write_text(raw.replace('"schema_version":"1.0"', '"schema_version":"1.0","schema_version":"1.0"', 1), encoding="utf-8")
+    with pytest.raises(ValueError):
+        verify_directory(path)
+
+
+@pytest.mark.parametrize("shape", ["extra_file", "extra_dir", "symlink", "hardlink", "fifo"])
+def test_diagnostic_directory_shape_attacks_are_exact_and_isolated(tmp_path, shape):
+    path = _committed_diagnostic_fixture(tmp_path)
+    target = path / "run-manifest.json"
+    if shape == "extra_file":
+        (path / "unexpected").write_text("unexpected", encoding="utf-8")
+    elif shape == "extra_dir":
+        (path / "unexpected").mkdir()
+    elif shape == "symlink":
+        (path / "unexpected").symlink_to(target)
+    elif shape == "hardlink":
+        (path / "unexpected").hardlink_to(target)
+    else:
+        os.mkfifo(path / "unexpected")
+    with pytest.raises(ValueError):
+        verify_directory(path)
+
+
+def test_diagnostic_private_sentinel_and_published_rebound_fail_closed(tmp_path):
+    diagnostic = _committed_diagnostic_fixture(tmp_path / "diagnostic")
+    manifest_path = diagnostic / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["repository_policy_summary"]["applied_public_excluded_owner_ids"] = ["private-owner"]
+    manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="privacy_invariant_failed"):
+        verify_directory(diagnostic)
+
+    published = _committed_published_fixture(tmp_path / "published")
+    manifest_path = published / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["observed_at"] = "2026-08-02T00:00:00Z"
+    manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        verify_directory(published)
+
+
+@pytest.mark.parametrize("reason", ["identity_node_mismatch", "authentication_failed"])
+def test_diagnostic_identity_auth_failure_replays_all_six_sources(tmp_path, reason):
+    path = _committed_diagnostic_fixture(tmp_path)
+    manifest_path = path / "run-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for row in manifest["diagnostic_source_status"]["rows"]:
+        row.update({"status": "failed", "reason": reason, "pagination_complete": None, "partition_complete": None, "snapshot_complete": None, "visibility_complete": None, "snapshot_completed_at": None})
+    manifest["run_reason"] = "core_source_incomplete"
+    manifest["source_status_summary"] = source_summary(manifest["diagnostic_source_status"])
+    manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+    loaded, code = verify_directory(path)
+    assert loaded["diagnostic_source_status"]["rows"]
+    assert len(loaded["diagnostic_source_status"]["rows"]) == 6
+    assert code == 3

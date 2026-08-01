@@ -17,10 +17,15 @@ case "$3" in
     ;;
   collect)
     if [ "${FIXTURE_MODE:-success}" = "collector_crash" ]; then exit 99; fi
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--period" ]; then export FIXTURE_PERIOD_KIND="$arg"; fi
+      previous="$arg"
+    done
     "$python_bin" "$FIXTURE_BUILDER" "${FIXTURE_MODE:-success}"
     case "${FIXTURE_MODE:-diagnostic_success}" in
       collector_2) exit 2 ;;
-      published) exit 0 ;;
+      published|collector_0_diagnostic) exit 0 ;;
       safe_diagnostic|validation_failed|collector_4) exit 4 ;;
       *) exit 3 ;;
     esac

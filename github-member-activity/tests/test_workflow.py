@@ -46,6 +46,21 @@ def test_workflow_has_frozen_static_contract():
     trigger = data.get("on", data.get(True))
     assert {item["cron"] for item in trigger["schedule"]} == {"15 1 * * 2", "30 1 2 * *"}
     assert trigger["workflow_dispatch"]["inputs"]["period"]["options"] == ["weekly", "monthly"]
+    steps = data["jobs"]["collect"]["steps"]
+    assert steps[0]["uses"] == "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+    assert steps[1]["uses"] == "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+    assert steps[1]["with"] == {"python-version": "3.14"}
+    assert steps[2]["uses"] == "astral-sh/setup-uv@6b9c6063abd4a2e6e5c9c6d6d0c7d25f4c0b0c21"
+    collect_step = next(step for step in steps if step.get("id") == "collect")
+    assert collect_step["name"] == "Collect and verify"
+    upload_step = next(step for step in steps if step.get("id") == "upload")
+    assert upload_step["uses"] == "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+    assert upload_step["if"] == "always() && steps.collect.outputs.artifact_ready == 'true'"
+    assert upload_step["with"] == {"name": "github-member-activity-${{ steps.collect.outputs.period_id }}-${{ steps.collect.outputs.period_utc_slug }}-${{ steps.collect.outputs.manifest_sha256 }}", "path": "${{ steps.collect.outputs.artifact_path }}", "if-no-files-found": "error"}
+    final_step = next(step for step in steps if step.get("name") == "Final gate")
+    assert final_step["if"] == "always()"
+    assert final_step["run"] == "scripts/final_gate.sh"
+    assert final_step["env"] == {"COLLECT_EXIT_CODE": "${{ steps.collect.outputs.exit_code || '4' }}", "ARTIFACT_READY": "${{ steps.collect.outputs.artifact_ready }}", "UPLOAD_OUTCOME": "${{ steps.upload.outcome }}"}
     assert "github_member_activity.workflow_gate" in wrapper
     assert "scripts/workflow_wrapper.sh" in text
     assert "scripts/final_gate.sh" in text
@@ -71,14 +86,27 @@ def test_workflow_exit_matrix_is_executable():
         assert evaluate(collector_code, receipt_present=receipt, manifest_status=status, manifest_publishable=publishable, manifest_reason=reason, validator_status=validator, validator_reason=validator_reason, verify_code=verify_code) == expected
 
 
-@pytest.mark.parametrize("collector_code", [0, 2, 3, 4])
-@pytest.mark.parametrize("artifact_ready", ["true", "false", ""])
-@pytest.mark.parametrize("upload_outcome", ["success", "failure", "skipped"])
-def test_final_gate_executes_all_frozen_36_unique_combinations(collector_code, artifact_ready, upload_outcome):
+@pytest.mark.parametrize("collector_code", [0, 2, 3, 4, 9, None])
+@pytest.mark.parametrize("artifact_ready", ["true", "false", None])
+@pytest.mark.parametrize("upload_outcome", ["success", "failure", "skipped", None])
+def test_final_gate_executes_all_frozen_72_unique_combinations(collector_code, artifact_ready, upload_outcome):
     gate = Path(__file__).parents[1] / "scripts" / "final_gate.sh"
+    env = dict(os.environ)
+    if collector_code is None:
+        env.pop("COLLECT_EXIT_CODE", None)
+    else:
+        env["COLLECT_EXIT_CODE"] = str(collector_code)
+    if artifact_ready is None:
+        env.pop("ARTIFACT_READY", None)
+    else:
+        env["ARTIFACT_READY"] = artifact_ready
+    if upload_outcome is None:
+        env.pop("UPLOAD_OUTCOME", None)
+    else:
+        env["UPLOAD_OUTCOME"] = upload_outcome
     result = subprocess.run(
         [str(gate)],
-        env={**os.environ, "COLLECT_EXIT_CODE": str(collector_code), "ARTIFACT_READY": artifact_ready, "UPLOAD_OUTCOME": upload_outcome},
+        env=env,
         check=False,
     )
     if collector_code in {0, 3}:
@@ -130,6 +158,8 @@ def test_workflow_run_blocks_are_shell_parseable_and_all_production_runs_are_ext
         ("safe_diagnostic", True, 4, 4),
         ("validation_failed", True, 4, 4),
         ("collector_2", False, 2, 2),
+        ("collector_0_diagnostic", False, 4, 0),
+        ("collector_3_code4_reason", False, 4, 3),
         ("collector_4", True, 4, 4),
         ("verify_fail", False, 4, 3),
         ("malformed_receipt", False, 4, 3),
@@ -206,6 +236,30 @@ def test_committed_workflow_fixtures_execute_real_verify_receipt_path_and_fault_
         assert failed_upload.returncode == 4
 
 
+def test_workflow_fixture_fails_when_fake_verify_bypasses_production_cli(tmp_path):
+    root = Path(__file__).parents[1]
+    fixtures = root / "tests" / "fixtures" / "workflow"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_uv = (fixtures / "fake_uv.sh").read_text(encoding="utf-8")
+    fake_uv = fake_uv.replace('    "$python_bin" -m github_member_activity verify "${@:4}"\n', "    exit 3\n")
+    (fake_bin / "uv").write_text(fake_uv, encoding="utf-8")
+    (fake_bin / "uv").chmod(0o755)
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    (run_root / "config.yaml").write_text((fixtures / "config.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+    runner_temp = run_root / "runner-temp"
+    runner_temp.mkdir()
+    output = run_root / "github-output"
+    env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}", "PYTHONPATH": str(root / "src"), "PYTHON_EXECUTABLE": sys.executable, "FIXTURE_BUILDER": str(fixtures / "build_fixture.py"), "FIXTURE_MODE": "published", "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "WORKFLOW_EVENT_NAME": "schedule", "WORKFLOW_SCHEDULE": "15 1 * * 2"}
+    result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
+    assert result.returncode == 0
+    values = _values(output)
+    assert values["collector_exit_code"] == "0"
+    assert values["artifact_ready"] == "false"
+    assert values["exit_code"] == "4"
+
+
 @pytest.mark.parametrize("event_name,schedule,dispatch,expected_period", [
     ("schedule", "15 1 * * 2", "", "weekly"),
     ("schedule", "30 1 2 * *", "", "monthly"),
@@ -273,6 +327,8 @@ def test_workflow_event_period_mapping_is_executed(tmp_path, event_name, schedul
     result = subprocess.run([str(root / "scripts" / "workflow_wrapper.sh")], cwd=run_root, env=env, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert f"--period {expected}" in args_log.read_text(encoding="utf-8")
+    values = _values(output)
+    assert values["period_id"] == ("monthly-20260701--20260801" if expected == "monthly" else "weekly-20260727--20260803")
 
 
 def test_workflow_unsupported_event_fails_without_collection(tmp_path):
