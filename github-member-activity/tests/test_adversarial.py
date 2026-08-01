@@ -59,6 +59,11 @@ def test_status_matrix_accepts_snapshot_complete_partial_with_visibility_gap():
     failed["rows"][0]["reason"] = "api_contract_violation"
     _validate_status(failed)
 
+    illegal_partition = {**legal, "rows": [dict(row) for row in legal["rows"]]}
+    illegal_partition["rows"][0]["partition_complete"] = False
+    with pytest.raises(ValueError, match="source_status_invalid"):
+        _validate_status(illegal_partition)
+
 
 def test_commit_partial_reason_is_canonical_and_member_window_is_six_source_consistent():
     illegal = _statuses(failed_source="commit_context", failed_reason="pagination_incomplete")
@@ -69,7 +74,12 @@ def test_commit_partial_reason_is_canonical_and_member_window_is_six_source_cons
     commit_row = valid_member["rows"][-1]
     commit_row.update({"status": "not_applicable", "reason": "member_window_empty", "pagination_complete": None, "partition_complete": None, "snapshot_complete": None, "visibility_complete": None, "snapshot_completed_at": None})
     with pytest.raises(ValueError, match="diagnostic_state_invalid"):
-        _validate_diagnostic_state({"run_reason": "core_source_incomplete", "diagnostic_source_status": valid_member})
+        _validate_diagnostic_state({"observed_at": "2026-01-02T00:00:00Z", "run_reason": "core_source_incomplete", "diagnostic_source_status": valid_member})
+
+    stale_snapshot = _statuses()
+    stale_snapshot["rows"][0]["snapshot_completed_at"] = "2026-01-01T00:00:00Z"
+    with pytest.raises(ValueError, match="diagnostic_state_invalid"):
+        _validate_diagnostic_state({"observed_at": "2026-01-02T00:00:00Z", "run_reason": "core_source_incomplete", "diagnostic_source_status": stale_snapshot})
 
 
 def test_ledger_model_rejects_ordinary_quantity_and_wrong_partition():

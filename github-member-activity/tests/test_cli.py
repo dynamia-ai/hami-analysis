@@ -70,7 +70,7 @@ def test_collect_oserror_is_run_aborted_not_artifact_failure(tmp_path, monkeypat
     assert '"run_reason":"run_aborted"' in (diagnostic[0] / "run-manifest.json").read_text(encoding="utf-8")
 
 
-def test_receipt_compensation_failure_stops_before_diagnostic(tmp_path, monkeypatch):
+def test_receipt_failure_stops_before_diagnostic_without_recursive_compensation(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
     monkeypatch.setenv("PUBLIC_GITHUB_TOKEN", "test-token")
@@ -93,17 +93,9 @@ def test_receipt_compensation_failure_stops_before_diagnostic(tmp_path, monkeypa
     published = tmp_path / "published-run"
     monkeypatch.setattr(cli_module, "write_published", lambda *args, **kwargs: published)
     monkeypatch.setattr(cli_module, "_write_receipt", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("receipt write")))
-    cleanup_calls = []
-
-    def failed_cleanup(*args, **kwargs):
-        cleanup_calls.append(True)
-        raise ValueError("cleanup blocked")
-
-    monkeypatch.setattr(cli_module, "_remove_owned_run", failed_cleanup)
     receipt = tmp_path / "github-member-activity-receipt.json"
     result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly", "--scheduled", "--receipt-path", str(receipt)])
     assert result.exit_code == 4
-    assert cleanup_calls == [True]
     assert not (tmp_path / "diagnostics").exists()
 
 

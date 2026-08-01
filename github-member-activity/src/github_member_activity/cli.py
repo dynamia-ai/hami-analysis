@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import re
 import tempfile
@@ -81,18 +80,6 @@ def _write_receipt(path: Path, report_period, rid: str, run_dir: Path, base_dir:
         if temp_path is not None and temp_path.exists():
             temp_path.unlink()
         raise
-
-
-def _remove_owned_run(run_dir: Path, rid: str) -> None:
-    if not run_dir.is_dir() or run_dir.is_symlink() or run_dir.name != rid:
-        raise ValueError("owned run binding mismatch")
-    manifest_path = run_dir / "run-manifest.json"
-    if not manifest_path.is_file() or manifest_path.is_symlink():
-        raise ValueError("owned run manifest missing")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("run_id") != rid:
-        raise ValueError("owned run manifest mismatch")
-    shutil.rmtree(run_dir)
 
 
 def _safe_output_root(config_path: Path, relative: str) -> Path:
@@ -226,12 +213,8 @@ def collect_command(
                     try:
                         _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
                     except Exception as receipt_exc:
-                        try:
-                            _remove_owned_run(path, rid)
-                        except Exception as cleanup_exc:
-                            typer.echo("Error: published artifact compensation failed; preserving the published artifact as the sole authority", err=True)
-                            raise typer.Exit(4) from cleanup_exc
-                        raise receipt_exc
+                        typer.echo("Error: receipt write failed; preserving the published artifact as the sole authority", err=True)
+                        raise typer.Exit(4) from receipt_exc
                 typer.echo(f"published: {path}")
                 return
         except typer.Exit:
@@ -282,11 +265,7 @@ def collect_command(
         try:
             _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
         except Exception as exc:
-            try:
-                _remove_owned_run(path, rid)
-            except Exception:
-                pass
-            typer.echo("Error: receipt path is unsafe", err=True)
+            typer.echo("Error: receipt write failed; preserving the diagnostic artifact as the sole authority", err=True)
             raise typer.Exit(4) from exc
     typer.echo(f"diagnostic: {path}", err=True)
     raise typer.Exit(3 if reason in {"stability_gap_not_met", "no_applicable_members"} else 4)

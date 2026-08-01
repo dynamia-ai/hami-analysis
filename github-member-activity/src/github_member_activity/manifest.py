@@ -245,10 +245,17 @@ def verify_directory(run_dir: Path, *, allow_temp: bool = False) -> tuple[dict[s
 def _validate_diagnostic_state(manifest: dict[str, Any]) -> None:
     rows = manifest["diagnostic_source_status"]["rows"]
     reason = manifest["run_reason"]
+    observed = parse_rfc3339(manifest["observed_at"])
     by_member: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         by_member.setdefault(row["member_id"], []).append(row)
     for member_rows in by_member.values():
+        for row in member_rows:
+            timestamp = row["snapshot_completed_at"]
+            if timestamp is not None:
+                parsed = parse_rfc3339(timestamp)
+                if format_z(parsed) != timestamp or parsed < observed:
+                    raise ValueError("diagnostic_state_invalid")
         core_rows = [row for row in member_rows if row["criticality"] == "core"]
         if any(row["status"] == "not_applicable" for row in core_rows) and any(row["status"] != "not_applicable" for row in core_rows):
             raise ValueError("diagnostic_state_invalid")
@@ -434,6 +441,8 @@ def _validate_status(value: dict[str, Any]) -> None:
         if row["partition_complete"] is True and row["pagination_complete"] is not True:
             raise ValueError("source_status_invalid")
         if row["snapshot_complete"] is True and row["pagination_complete"] is not True:
+            raise ValueError("source_status_invalid")
+        if row["snapshot_complete"] is True and row["source"] not in {"issue_replies", "prs_reviewed"} and row["partition_complete"] is not True:
             raise ValueError("source_status_invalid")
         if row["status"] in {"not_applicable", "not_run"} or (row["status"] != "complete" and (row["reason"] in IDENTITY_REASONS or row["source"] == "commit_context")):
             if any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete")):
