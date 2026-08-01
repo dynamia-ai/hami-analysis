@@ -15,7 +15,7 @@ from .canonical import sha256_json
 TOKEN_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 MEMBER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 LOGIN_RE = re.compile(r"^(?!-)[A-Za-z0-9-]{1,39}(?<!-)$")
-NODE_RE = re.compile(r"^[A-Za-z0-9_:-]+$")
+NODE_RE = re.compile(r"^[A-Za-z0-9_:+/=\-]+$")
 
 
 class GithubConfig(BaseModel):

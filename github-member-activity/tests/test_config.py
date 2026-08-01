@@ -31,3 +31,9 @@ def test_config_rejects_private_mode_and_extra_fields():
     bad["unexpected"] = True
     with pytest.raises(ValueError):
         AppConfig.model_validate(bad)
+
+
+def test_config_accepts_padded_github_node_ids():
+    value = config()
+    value["members"][0]["github_node_id"] = "MDQ6VXNlcjMzMjgxODU="
+    assert AppConfig.model_validate(value).members[0].github_node_id.endswith("=")
