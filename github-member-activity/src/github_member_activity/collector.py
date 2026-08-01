@@ -35,6 +35,16 @@ query($ids:[ID!]!) {
 }
 """
 
+DISCOVERY_QUERY = """
+query($ids:[ID!]!) {
+  nodes(ids:$ids) {
+    __typename id
+    ... on PullRequest { author { __typename id } createdAt mergedAt repository { id visibility owner { id } } }
+    ... on Issue { author { __typename id } createdAt repository { id visibility owner { id } } }
+  }
+}
+"""
+
 ISSUE_COMMENTS_QUERY = """
 query($login:String!, $after:String) {
   user(login:$login) {
@@ -160,9 +170,30 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
 
         all_candidates = [(source, kind, time_field, candidate) for source, (kind, time_field, candidates) in candidate_rows.items() for candidate in candidates]
         if all_candidates:
-            data = client.graphql(HYDRATE_QUERY, {"ids": list(dict.fromkeys(candidate.node_id for _, _, _, candidate in all_candidates))})
+            candidate_ids = list(dict.fromkeys(candidate.node_id for _, _, _, candidate in all_candidates))
+            discovery_snapshots: list[tuple[tuple[Any, ...], ...]] = []
+            discovery_nodes: list[dict[str, Any]] = []
+            for _ in range(2):
+                discovery_data = client.graphql(DISCOVERY_QUERY, {"ids": candidate_ids})
+                raw_discovery = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
+                if not isinstance(raw_discovery, list) or len(raw_discovery) != len(candidate_ids) or any(not isinstance(node, dict) or node.get("id") not in candidate_ids for node in raw_discovery) or {node.get("id") for node in raw_discovery if isinstance(node, dict)} != set(candidate_ids):
+                    for source, _, _, _ in all_candidates:
+                        set_status(member.member_id, source, "failed", "visibility_unverified")
+                    discovery_nodes = []
+                    break
+                discovery_nodes = [node for node in raw_discovery if isinstance(node, dict)]
+                discovery_snapshots.append(tuple(sorted((node.get("id"), node.get("__typename"), (node.get("author") or {}).get("id"), node.get("createdAt"), node.get("mergedAt"), (node.get("repository") or {}).get("id"), (node.get("repository") or {}).get("visibility"), ((node.get("repository") or {}).get("owner") or {}).get("id")) for node in discovery_nodes)))
+            if not discovery_snapshots or discovery_snapshots[0] != discovery_snapshots[1]:
+                for source, _, _, _ in all_candidates:
+                    set_status(member.member_id, source, "partial", "graphql_snapshot_unstable")
+                continue
+            if any((node.get("repository") or {}).get("visibility") != "PUBLIC" for node in discovery_nodes):
+                for source, _, _, _ in all_candidates:
+                    set_status(member.member_id, source, "failed", "visibility_unverified")
+                continue
+            data = client.graphql(HYDRATE_QUERY, {"ids": candidate_ids})
             nodes = data.get("nodes") if isinstance(data, dict) else None
-            if not isinstance(nodes, list) or len(nodes) != len(set(candidate.node_id for _, _, _, candidate in all_candidates)):
+            if not isinstance(nodes, list) or len(nodes) != len(candidate_ids):
                 for source, _, _, _ in all_candidates:
                     set_status(member.member_id, source, "failed", "visibility_unverified")
                 continue

@@ -237,6 +237,8 @@ def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
         raise ValueError("source_status_invalid")
     if manifest.get("safe_resolved_config_sha256") != digest_file(run_dir / "resolved-config.json"):
         raise ValueError("artifact_binding_mismatch")
+    if manifest.get("member_config_sha256") != sha256_json(members):
+        raise ValueError("artifact_binding_mismatch")
     rows: list[dict[str, Any]] = []
     keys: set[str] = set()
     digests: set[str] = set()
