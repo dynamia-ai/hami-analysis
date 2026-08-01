@@ -18,7 +18,8 @@ def _stamp(value: datetime) -> str:
 
 
 def _query(base: str, start: datetime, end: datetime) -> str:
-    return f"{base} created:{_stamp(start)}..{_stamp(end)}"
+    qualifier = "merged" if "is:merged" in base else "created"
+    return f"{base} {qualifier}:{_stamp(start)}..{_stamp(end)}"
 
 
 def _leaf(client: GitHubClient, base: str, start: datetime, end: datetime, first_page=None) -> list[SearchCandidate]:
@@ -40,12 +41,12 @@ def _leaf(client: GitHubClient, base: str, start: datetime, end: datetime, first
             node_id = item.get("node_id")
             created_at = item.get("created_at")
             actor_node_id = item.get("actor_node_id")
-            if not isinstance(node_id, str) or not isinstance(created_at, str):
+            if not isinstance(node_id, str) or not isinstance(created_at, str) or not isinstance(actor_node_id, str) or not actor_node_id:
                 raise GitHubRequestError("api_contract_violation")
             if node_id in seen:
                 raise GitHubRequestError("search_cardinality_mismatch")
             seen.add(node_id)
-            rows.append(SearchCandidate(node_id, actor_node_id if isinstance(actor_node_id, str) else "", created_at))
+            rows.append(SearchCandidate(node_id, actor_node_id, created_at))
         if len(rows) == total:
             return rows
         page_number += 1
@@ -65,9 +66,9 @@ def _collect_once(client: GitHubClient, base: str, start: datetime, end: datetim
         raise GitHubRequestError("search_capped")
     left = _collect_once(client, base, start, midpoint)
     right = _collect_once(client, base, midpoint, end)
-    merged: dict[tuple[str, str], SearchCandidate] = {}
+    merged: dict[str, SearchCandidate] = {}
     for candidate in left + right:
-        key = (candidate.node_id, candidate.created_at)
+        key = candidate.node_id
         previous = merged.get(key)
         if previous and previous != candidate:
             raise GitHubRequestError("search_candidate_conflict")

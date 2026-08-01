@@ -14,3 +14,10 @@ def test_dimension_counts_do_not_form_total_score():
     assert metrics["issue_replies_created"] == 2
     assert metrics["issues_replied_to"] == 1
     assert result["team"]["by_dimension"]["issue_replies"]["unique_artifacts"] == 1
+
+
+def test_ledger_round_trip_is_not_recursive():
+    row = event("pr_opened", "P_1", "P_1")
+    value = row.to_dict()
+    assert value["normalized_row_digest"] == row.normalized_row_digest
+    assert type(row).from_dict(value) == row

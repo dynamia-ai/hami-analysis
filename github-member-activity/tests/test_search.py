@@ -10,7 +10,7 @@ class FakeSearch:
 
     def search(self, query: str, *, page: int = 1):
         self.calls.append((query, page))
-        return SearchPage(({"node_id": "P_1", "id": 1, "created_at": "2026-01-01T00:00:00Z"},), 1, False)
+        return SearchPage(({"node_id": "P_1", "id": 1, "actor_node_id": "U_1", "created_at": "2026-01-01T00:00:00Z"},), 1, False)
 
 
 def test_search_uses_created_sort_and_two_stable_snapshots():

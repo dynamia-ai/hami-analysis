@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -72,9 +73,9 @@ class GitHubClient:
             raise GitHubRequestError("api_contract_violation")
         safe = []
         for item in data["items"]:
-            if not isinstance(item, dict) or not isinstance(item.get("id"), int) or not isinstance(item.get("node_id"), str):
+            if not isinstance(item, dict) or not isinstance(item.get("id"), int) or not isinstance(item.get("node_id"), str) or not isinstance(item.get("created_at"), str) or not isinstance((item.get("user") or {}).get("node_id"), str):
                 raise GitHubRequestError("api_contract_violation")
-            safe.append({"id": item["id"], "node_id": item["node_id"], "created_at": item.get("created_at")})
+            safe.append({"id": item["id"], "node_id": item["node_id"], "actor_node_id": item["user"]["node_id"], "created_at": item["created_at"]})
         return SearchPage(tuple(safe), data["total_count"], bool(data.get("incomplete_results")))
 
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
@@ -89,7 +90,8 @@ class GitHubClient:
     def connection(self, query: str, variables: dict[str, Any], path: tuple[str, ...]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         cursor: str | None = None
-        seen: set[str] = set()
+        seen_cursors: set[str] = set()
+        seen_nodes: set[str] = set()
         expected_total: int | None = None
         while True:
             current = dict(variables)
@@ -99,18 +101,24 @@ class GitHubClient:
                 data = data.get(part) if isinstance(data, dict) else None
             if not isinstance(data, dict) or not isinstance(data.get("edges"), list) or not isinstance(data.get("pageInfo"), dict):
                 raise GitHubRequestError("api_contract_violation")
-            if isinstance(data.get("totalCount"), int):
-                expected_total = data["totalCount"] if expected_total is None else expected_total
-                if expected_total != data["totalCount"]:
-                    raise GitHubRequestError("graphql_cardinality_mismatch")
+            if not isinstance(data.get("totalCount"), int) or data["totalCount"] < 0:
+                raise GitHubRequestError("api_contract_violation")
+            expected_total = data["totalCount"] if expected_total is None else expected_total
+            if expected_total != data["totalCount"]:
+                raise GitHubRequestError("graphql_cardinality_mismatch")
             edges = data["edges"]
             for edge in edges:
                 if not isinstance(edge, dict) or not isinstance(edge.get("cursor"), str) or not isinstance(edge.get("node"), dict):
                     raise GitHubRequestError("api_contract_violation")
                 edge_cursor = edge["cursor"]
-                if edge_cursor in seen:
+                if edge_cursor in seen_cursors:
                     raise GitHubRequestError("graphql_cardinality_mismatch")
-                seen.add(edge_cursor)
+                seen_cursors.add(edge_cursor)
+                node_id = edge["node"].get("id")
+                stable_node = str(node_id) if isinstance(node_id, str) else json.dumps(edge["node"], sort_keys=True, separators=(",", ":"))
+                if stable_node in seen_nodes:
+                    raise GitHubRequestError("graphql_cardinality_mismatch")
+                seen_nodes.add(stable_node)
                 result.append(edge["node"])
             info = data["pageInfo"]
             has_next = info.get("hasNextPage")
@@ -121,6 +129,6 @@ class GitHubClient:
                 if expected_total is not None and len(result) != expected_total:
                     raise GitHubRequestError("graphql_cardinality_mismatch")
                 return result
-            if not isinstance(next_cursor, str) or next_cursor in seen or (cursor is not None and next_cursor == cursor):
+            if not isinstance(next_cursor, str) or (cursor is not None and next_cursor == cursor):
                 raise GitHubRequestError("cursor_invalid")
             cursor = next_cursor

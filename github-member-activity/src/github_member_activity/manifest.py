@@ -6,12 +6,16 @@ import os
 import re
 import shutil
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
-from .canonical import canonical_bytes, sha256_bytes
+from .canonical import canonical_bytes, sha256_bytes, sha256_json
+from .metrics import aggregate
 from .models import LEDGER_FIELDS, SCHEMA_VERSION, SourceStatus
+from .period import parse_rfc3339
+from .validation import validate_evidence_url
 
 ARTIFACTS = ("resolved_config", "event_ledger", "source_status", "summary_json", "summary_csv", "report_md")
 ARTIFACT_FILES = {"resolved_config": "resolved-config.json", "event_ledger": "event-ledger.jsonl", "source_status": "source-status.json", "summary_json": "summary.json", "summary_csv": "summary.csv", "report_md": "report.md"}
@@ -50,13 +54,15 @@ def source_summary(status: dict[str, Any]) -> dict[str, Any]:
 
 
 def write_diagnostic(root: Path, manifest: dict[str, Any]) -> Path:
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise ValueError("unsafe diagnostics root")
     root.mkdir(parents=True, exist_ok=True)
     target = root / manifest["run_id"]
-    if target.exists():
+    if target.exists() or target.is_symlink():
         raise FileExistsError("output_conflict")
     temp = root / f".{manifest['run_id']}.tmp"
     if temp.exists():
-        shutil.rmtree(temp)
+        raise FileExistsError("output_conflict")
     temp.mkdir()
     (temp / "run-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     temp.replace(target)
@@ -72,13 +78,16 @@ def write_published(root: Path, period_id: str, rid: str, files: dict[str, bytes
     if set(files) != set(ARTIFACT_FILES.values()):
         raise ValueError("artifact set mismatch")
     period_root = root / period_id
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        raise ValueError("unsafe output root")
+    root.mkdir(parents=True, exist_ok=True)
     period_root.mkdir(parents=True, exist_ok=True)
     target = period_root / rid
-    if target.exists():
+    if target.exists() or target.is_symlink():
         raise FileExistsError("output_conflict")
     temp = period_root / f".{rid}.tmp"
     if temp.exists():
-        shutil.rmtree(temp)
+        raise FileExistsError("output_conflict")
     temp.mkdir()
     bindings: dict[str, dict[str, Any]] = {}
     for key, filename in ARTIFACT_FILES.items():
@@ -96,6 +105,11 @@ def write_published(root: Path, period_id: str, rid: str, files: dict[str, bytes
     if {path.name for path in temp.iterdir()} != {"run-manifest.json", *ARTIFACT_FILES.values()}:
         shutil.rmtree(temp)
         raise ValueError("directory_shape_invalid")
+    try:
+        verify_directory(temp)
+    except Exception:
+        shutil.rmtree(temp)
+        raise
     temp.replace(target)
     return target
 
@@ -106,21 +120,199 @@ def verify_directory(run_dir: Path) -> tuple[dict[str, Any], int]:
     manifest_path = run_dir / "run-manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise ValueError("missing manifest")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != SCHEMA_VERSION:
+    manifest = _strict_json(manifest_path)
+    required = {"schema_version", "run_id", "collector", "github_rest_api_version", "period", "observed_at", "publish_visibility_verified_at", "safe_resolved_config_sha256", "member_config_sha256", "repository_policy_summary", "source_status_summary", "semantic_ledger_sha256", "run_status", "run_reason", "publishable", "artifacts", "diagnostic_source_status", "validator_result"}
+    if set(manifest) != required or manifest.get("schema_version") != SCHEMA_VERSION or not isinstance(manifest.get("run_id"), str) or not RUN_ID_RE.fullmatch(manifest["run_id"]):
         raise ValueError("schema_invalid")
     expected = {"run-manifest.json"} if manifest.get("run_status") == "diagnostic" else {"run-manifest.json", *ARTIFACT_FILES.values()}
-    names = {path.name for path in run_dir.iterdir()}
+    entries = list(run_dir.iterdir())
+    if any(path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1 for path in entries):
+        raise ValueError("directory_shape_invalid")
+    names = {path.name for path in entries}
     if names != expected:
         raise ValueError("directory_shape_invalid")
     if manifest.get("run_status") == "diagnostic":
-        if manifest.get("publishable") is not False or any(manifest.get("artifacts", {}).get(key, {}).get("present") for key in ARTIFACTS):
+        if manifest.get("publishable") is not False or manifest.get("run_reason") not in {"stability_gap_not_met", "no_applicable_members", "run_aborted", "core_source_incomplete", "validation_failed", "artifact_write_failed", "output_conflict"} or manifest.get("validator_result") != {"status": "not_run", "reason": None} or not isinstance(manifest.get("diagnostic_source_status"), dict):
+            raise ValueError("manifest_binding_mismatch")
+        if any(manifest.get(field) is not None for field in ("publish_visibility_verified_at", "safe_resolved_config_sha256", "member_config_sha256", "semantic_ledger_sha256")):
+            raise ValueError("manifest_binding_mismatch")
+        _validate_status(manifest["diagnostic_source_status"])
+        if manifest.get("source_status_summary") != source_summary(manifest["diagnostic_source_status"]):
+            raise ValueError("source_status_invalid")
+        artifacts = manifest.get("artifacts")
+        if set(artifacts or {}) != set(ARTIFACTS) or any(value != {"present": False, "sha256": None} for value in artifacts.values()):
             raise ValueError("manifest_binding_mismatch")
         return manifest, 3
+    if manifest.get("run_status") != "published" or manifest.get("publishable") is not True or manifest.get("run_reason") is not None or manifest.get("validator_result") != {"status": "passed", "reason": None} or manifest.get("diagnostic_source_status") is not None:
+        raise ValueError("manifest_binding_mismatch")
+    if manifest.get("publish_visibility_verified_at") is None or not isinstance(manifest.get("artifacts"), dict) or set(manifest["artifacts"]) != set(ARTIFACTS):
+        raise ValueError("manifest_binding_mismatch")
     for key, filename in ARTIFACT_FILES.items():
         path = run_dir / filename
         if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
             raise ValueError("artifact_shape_invalid")
-        if manifest["artifacts"][key]["sha256"] != digest_file(path):
+        binding = manifest["artifacts"][key]
+        if binding != {"present": True, "sha256": digest_file(path)}:
             raise ValueError("artifact_binding_mismatch")
+    _validate_published(run_dir, manifest)
     return manifest, 0
+
+
+def _strict_json(path: Path) -> dict[str, Any]:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError("non-finite JSON number")))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("invalid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("JSON root must be object")
+    return value
+
+
+def _validate_status(value: dict[str, Any]) -> None:
+    if set(value) != {"schema_version", "rows"} or value["schema_version"] != SCHEMA_VERSION or not isinstance(value["rows"], list):
+        raise ValueError("source_status_invalid")
+    seen: set[tuple[str, str]] = set()
+    allowed = {"member_id", "source", "criticality", "status", "reason", "pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at"}
+    source_order = {name: index for index, name in enumerate(("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context"))}
+    previous: tuple[str, int] | None = None
+    for row in value["rows"]:
+        if not isinstance(row, dict) or set(row) != allowed:
+            raise ValueError("source_status_invalid")
+        key = (row["member_id"], row["source"])
+        if key in seen or row["source"] not in source_order or row["criticality"] not in {"core", "optional"} or row["status"] not in {"complete", "partial", "failed", "not_applicable", "not_run"}:
+            raise ValueError("source_status_invalid")
+        seen.add(key)
+        order_key = (row["member_id"], source_order[row["source"]])
+        if previous is not None and order_key < previous:
+            raise ValueError("source_status_invalid")
+        previous = order_key
+        if row["source"] == "commit_context" and row["criticality"] != "optional":
+            raise ValueError("source_status_invalid")
+        if row["source"] != "commit_context" and row["criticality"] != "core":
+            raise ValueError("source_status_invalid")
+        if row["status"] == "complete" and not all(row[field] is True for field in ("pagination_complete", "snapshot_complete", "visibility_complete")):
+            raise ValueError("source_status_invalid")
+        if row["source"] in {"issue_replies", "prs_reviewed"} and row["status"] == "complete" and row["partition_complete"] is not None:
+            raise ValueError("source_status_invalid")
+        if row["status"] == "not_applicable" and row["reason"] != "member_window_empty" and row["source"] != "commit_context":
+            raise ValueError("source_status_invalid")
+        if row["status"] == "complete" and row["reason"] is not None:
+            raise ValueError("source_status_invalid")
+        if row["source"] == "commit_context" and row["status"] != "complete" and any(row[field] is not None for field in ("pagination_complete", "partition_complete", "snapshot_complete", "visibility_complete", "snapshot_completed_at")):
+            raise ValueError("source_status_invalid")
+        if row["snapshot_complete"] is True and not isinstance(row["snapshot_completed_at"], str):
+            raise ValueError("source_status_invalid")
+    members = {member for member, _ in seen}
+    if len(seen) != len(members) * 6:
+        raise ValueError("source_status_invalid")
+
+
+def _validate_published(run_dir: Path, manifest: dict[str, Any]) -> None:
+    resolved = _strict_json(run_dir / "resolved-config.json")
+    if set(resolved) != {"schema_version", "timezone", "members", "repository_policy"} or resolved["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("schema_invalid")
+    members = resolved["members"]
+    if not isinstance(members, list) or any(set(member) != {"member_id", "github_login", "github_node_id", "active_from", "active_until"} for member in members):
+        raise ValueError("schema_invalid")
+    policy = resolved.get("repository_policy")
+    if not isinstance(policy, dict) or set(policy) != {"public_only", "first_party_owners", "applied_public_excluded_owner_ids", "applied_public_excluded_repo_ids"} or policy.get("public_only") is not True:
+        raise ValueError("schema_invalid")
+    status = _strict_json(run_dir / "source-status.json")
+    _validate_status(status)
+    if len(status["rows"]) != len(members) * 6:
+        raise ValueError("source_status_invalid")
+    if manifest.get("source_status_summary") != source_summary(status):
+        raise ValueError("source_status_invalid")
+    if manifest.get("safe_resolved_config_sha256") != digest_file(run_dir / "resolved-config.json"):
+        raise ValueError("artifact_binding_mismatch")
+    rows: list[dict[str, Any]] = []
+    keys: set[str] = set()
+    digests: set[str] = set()
+    previous_ledger_key: tuple[str, str, str, str, str] | None = None
+    ledger_path = run_dir / "event-ledger.jsonl"
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        try:
+            value = json.loads(line, object_pairs_hook=lambda items: dict(items), parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+            event = __import__("github_member_activity.models", fromlist=["LedgerEvent"]).LedgerEvent.from_dict(value)
+            if event.event_key in keys or event.normalized_row_digest in digests:
+                raise ValueError("ledger_invalid")
+            keys.add(event.event_key); digests.add(event.normalized_row_digest)
+            if event.member_id not in {member["member_id"] for member in members}:
+                raise ValueError("ledger_invalid")
+            validate_evidence_url(event, next(member["github_login"] for member in members if member["member_id"] == event.member_id))
+            source_row = next(row for row in status["rows"] if row["member_id"] == event.member_id and row["source"] == event.source)
+            if source_row["status"] != "complete":
+                raise ValueError("ledger_invalid")
+            ledger_key = (event.member_id, event.event_kind, event.occurred_at or "~", event.contribution_day or "~", event.event_key)
+            if previous_ledger_key is not None and ledger_key < previous_ledger_key:
+                raise ValueError("ledger_invalid")
+            previous_ledger_key = ledger_key
+            rows.append(event.to_dict())
+        except (json.JSONDecodeError, StopIteration, ValueError, KeyError) as exc:
+            raise ValueError("ledger_invalid") from exc
+    observed = parse_rfc3339(manifest["observed_at"])
+    visibility = parse_rfc3339(manifest["publish_visibility_verified_at"])
+    period_start = parse_rfc3339(manifest["period"]["start_utc"])
+    period_end = parse_rfc3339(manifest["period"]["end_utc"])
+    member_map = {member["member_id"]: member for member in members}
+    zone = ZoneInfo(resolved["timezone"])
+    policy = resolved["repository_policy"]
+    excluded_repos = set(policy["applied_public_excluded_repo_ids"])
+    excluded_owners = set(policy["applied_public_excluded_owner_ids"])
+    for row in rows:
+        collected = parse_rfc3339(row["collected_at"])
+        verified = parse_rfc3339(row["visibility_verified_at"])
+        if not observed <= collected <= verified <= visibility or row["visibility_verified_at"] != manifest["publish_visibility_verified_at"]:
+            raise ValueError("ledger_invalid")
+        member = member_map[row["member_id"]]
+        if row["actor_node_id"] != member["github_node_id"] or row["repo_node_id"] in excluded_repos or row["owner_node_id"] in excluded_owners:
+            raise ValueError("ledger_invalid")
+        if row["event_kind"] != "commit_day":
+            occurred = parse_rfc3339(row["occurred_at"])
+            if not period_start <= occurred < period_end:
+                raise ValueError("ledger_invalid")
+            active_start = datetime.fromisoformat(member["active_from"]).date()
+            active_end = datetime.fromisoformat(member["active_until"]).date() if member["active_until"] else None
+            local_day = occurred.astimezone(zone).date()
+            if local_day < active_start or (active_end is not None and local_day >= active_end):
+                raise ValueError("ledger_invalid")
+        else:
+            contribution_day = date.fromisoformat(row["contribution_day"])
+            local_start = period_start.astimezone(zone).date()
+            local_end = period_end.astimezone(zone).date()
+            if not local_start <= contribution_day < local_end:
+                raise ValueError("ledger_invalid")
+    if sha256_json(sorted(digests)) != manifest["semantic_ledger_sha256"]:
+        raise ValueError("artifact_binding_mismatch")
+    summary = _strict_json(run_dir / "summary.json")
+    if set(summary) != {"schema_version", "run_id", "period", "observed_at", "publishable", "members", "team"} or summary.get("schema_version") != SCHEMA_VERSION or not isinstance(summary.get("members"), list):
+        raise ValueError("schema_invalid")
+    metric_keys = {"prs_opened", "issues_opened", "issue_replies_created", "issues_replied_to", "prs_reviewed", "authored_prs_merged", "repositories_touched", "owners_touched", "external_repositories_touched", "repositories_accepting_prs", "commit_contributions", "commit_days", "repositories_with_commits"}
+    for member in summary["members"]:
+        if not isinstance(member, dict) or set(member) != {"member_id", "github_login", "metrics"} or set(member["metrics"]) != metric_keys:
+            raise ValueError("schema_invalid")
+    if not isinstance(summary.get("team"), dict) or set(summary["team"]) != {"by_dimension"} or set(summary["team"]["by_dimension"]) != {"prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged"}:
+        raise ValueError("schema_invalid")
+    if summary.get("run_id") != manifest["run_id"] or summary.get("period") != manifest["period"] or summary.get("observed_at") != manifest["observed_at"] or summary.get("publishable") is not True:
+        raise ValueError("aggregate_mismatch")
+    logins = {member["member_id"]: member["github_login"] for member in members}
+    commit_available = {row["member_id"]: row["status"] == "complete" for row in status["rows"] if row["source"] == "commit_context"}
+    expected = aggregate([__import__("github_member_activity.models", fromlist=["LedgerEvent"]).LedgerEvent.from_dict(row) for row in rows], list(logins), logins, set(policy["first_party_owners"]), commit_available)
+    if summary.get("members") != expected["members"] or summary.get("team") != expected["team"]:
+        raise ValueError("aggregate_mismatch")
+    source_text = (run_dir / "source-status.json").read_text(encoding="utf-8")
+    rendered = __import__("github_member_activity.renderers.markdown", fromlist=["render_markdown"]).render_markdown(summary, status)
+    if rendered != (run_dir / "report.md").read_text(encoding="utf-8"):
+        raise ValueError("aggregate_mismatch")
+    expected_csv = __import__("github_member_activity.renderers.csv", fromlist=["render_csv"]).render_csv(summary["members"])
+    if expected_csv != (run_dir / "summary.csv").read_text(encoding="utf-8"):
+        raise ValueError("aggregate_mismatch")

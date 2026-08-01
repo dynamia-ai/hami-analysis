@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qs, urlsplit
+from datetime import date, timedelta
+from urllib.parse import urlsplit
 
 from .models import LedgerEvent
 
@@ -10,7 +11,11 @@ NAME_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 
 def validate_evidence_url(event: LedgerEvent, login: str) -> None:
     parts = urlsplit(event.evidence_url)
-    if parts.scheme != "https" or parts.netloc != "github.com" or parts.username or parts.port or parts.query == "" and event.event_kind == "commit_day":
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("invalid evidence URL") from exc
+    if parts.scheme != "https" or parts.netloc != "github.com" or parts.username or port:
         raise ValueError("invalid evidence URL")
     if any(part == "" or "/" in part or not NAME_RE.fullmatch(part) for part in event.repo_full_name.split("/")):
         raise ValueError("invalid repository name")
@@ -24,6 +29,9 @@ def validate_evidence_url(event: LedgerEvent, login: str) -> None:
         if len(path) != 5 or path[3] != "issues" or not path[4].isdigit() or int(path[4]) <= 0 or parts.query or parts.fragment:
             raise ValueError("invalid issue evidence URL")
     else:
-        expected = f"/commits?author={login}&since={event.contribution_day}T00%3A00%3A00Z"
-        if not parts.path.endswith("/commits") or parts.fragment or parse_qs(parts.query).get("author") != [login] or "since=" not in parts.query or "until=" not in parts.query:
+        if event.contribution_day is None:
+            raise ValueError("invalid commit evidence URL")
+        next_day = (date.fromisoformat(event.contribution_day) + timedelta(days=1)).isoformat()
+        expected_query = f"author={login}&since={event.contribution_day}T00%3A00%3A00Z&until={next_day}T00%3A00%3A00Z"
+        if parts.path != f"/{event.repo_full_name}/commits" or parts.fragment or parts.query != expected_query:
             raise ValueError("invalid commit evidence URL")

@@ -9,7 +9,7 @@ from .models import CORE_SOURCES, EVENT_SOURCE, LedgerEvent
 METRICS = ("prs_opened", "issues_opened", "issue_replies_created", "issues_replied_to", "prs_reviewed", "authored_prs_merged", "repositories_touched", "owners_touched", "external_repositories_touched", "repositories_accepting_prs", "commit_contributions", "commit_days", "repositories_with_commits")
 
 
-def aggregate(events: list[LedgerEvent], member_ids: list[str], logins: dict[str, str], first_party_owners: set[str]) -> dict[str, Any]:
+def aggregate(events: list[LedgerEvent], member_ids: list[str], logins: dict[str, str], first_party_owners: set[str], commit_available: dict[str, bool] | None = None) -> dict[str, Any]:
     by_member: dict[str, list[LedgerEvent]] = defaultdict(list)
     for event in events:
         by_member[event.member_id].append(event)
@@ -30,9 +30,9 @@ def aggregate(events: list[LedgerEvent], member_ids: list[str], logins: dict[str
             "repositories_touched": len(repos), "owners_touched": len(owners),
             "external_repositories_touched": len({row.repo_node_id for row in core if row.owner_login.lower() not in first_party_owners}),
             "repositories_accepting_prs": len({row.repo_node_id for row in merged}),
-            "commit_contributions": sum(row.quantity for row in rows if row.event_kind == "commit_day") or None,
-            "commit_days": len({(row.repo_node_id, row.contribution_day) for row in rows if row.event_kind == "commit_day"}) or None,
-            "repositories_with_commits": len({row.repo_node_id for row in rows if row.event_kind == "commit_day"}) or None,
+            "commit_contributions": sum(row.quantity for row in rows if row.event_kind == "commit_day") if (commit_available or {}).get(member_id, False) else None,
+            "commit_days": len({(row.repo_node_id, row.contribution_day) for row in rows if row.event_kind == "commit_day"}) if (commit_available or {}).get(member_id, False) else None,
+            "repositories_with_commits": len({row.repo_node_id for row in rows if row.event_kind == "commit_day"}) if (commit_available or {}).get(member_id, False) else None,
         }
         members.append({"member_id": member_id, "github_login": logins[member_id], "metrics": metrics})
     dimensions = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged")
