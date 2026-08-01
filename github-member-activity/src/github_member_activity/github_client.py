@@ -103,7 +103,7 @@ class GitHubClient:
                 data = data.get(part) if isinstance(data, dict) else None
             if not isinstance(data, dict) or not isinstance(data.get("edges"), list) or not isinstance(data.get("pageInfo"), dict):
                 raise GitHubRequestError("api_contract_violation")
-            if not isinstance(data.get("totalCount"), int) or data["totalCount"] < 0:
+            if not isinstance(data.get("totalCount"), int) or isinstance(data.get("totalCount"), bool) or data["totalCount"] < 0:
                 raise GitHubRequestError("api_contract_violation")
             expected_total = data["totalCount"] if expected_total is None else expected_total
             if expected_total != data["totalCount"]:

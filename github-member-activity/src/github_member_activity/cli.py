@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import re
 import tempfile
@@ -18,7 +19,7 @@ from .config import AppConfig, load_config, member_config_sha256, safe_resolved_
 from .github_client import GitHubClient
 from .manifest import ARTIFACTS, ARTIFACT_FILES, digest_file, ledger_text, run_id, source_status_object, source_summary, verify_directory, write_diagnostic, write_published
 from .metrics import aggregate
-from .period import build_period, effective_window, format_z
+from .period import build_period, effective_window, format_z, validate_local_date
 from .renderers import render_csv, render_markdown, render_summary, write_json
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -66,10 +67,28 @@ def _write_receipt(path: Path, report_period, rid: str, run_dir: Path, base_dir:
     period_slug = f"{report_period.start_utc:%Y%m%dt%H%M%Sz}--{report_period.end_utc:%Y%m%dt%H%M%Sz}"
     manifest_sha = digest_file(run_dir / "run-manifest.json")
     receipt = {"schema_version": "1.0", "period_id": report_period.id, "period_utc_slug": period_slug, "run_id": rid, "run_dir": str(relative_run_dir), "manifest_sha256": manifest_sha}
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".github-member-activity-receipt.", delete=False) as stream:
-        temp_path = Path(stream.name)
-        stream.write(canonical_json(receipt) + "\n")
-    os.replace(temp_path, path)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=".github-member-activity-receipt.", delete=False) as stream:
+            temp_path = Path(stream.name)
+            stream.write(canonical_json(receipt) + "\n")
+        os.replace(temp_path, path)
+    except Exception:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
+        raise
+
+
+def _remove_owned_run(run_dir: Path, rid: str) -> None:
+    if not run_dir.is_dir() or run_dir.is_symlink() or run_dir.name != rid:
+        raise ValueError("owned run binding mismatch")
+    manifest_path = run_dir / "run-manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise ValueError("owned run manifest missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("run_id") != rid:
+        raise ValueError("owned run manifest mismatch")
+    shutil.rmtree(run_dir)
 
 
 def _safe_output_root(config_path: Path, relative: str) -> Path:
@@ -101,6 +120,10 @@ def validate_config(config: Path = typer.Option(..., "--config", exists=True, di
     try:
         _safe_output_root(config, value.output.directory)
         _safe_output_root(config, "diagnostics")
+        for member in value.members:
+            validate_local_date(member.active_from, value.period.timezone)
+            if member.active_until is not None:
+                validate_local_date(member.active_until, value.period.timezone)
     except ValueError as exc:
         typer.echo("Error: configured output path is unsafe", err=True)
         raise typer.Exit(2) from exc
@@ -131,6 +154,16 @@ def collect_command(
         typer.echo("Error: scheduled mode requires Asia/Shanghai", err=True)
         raise typer.Exit(2)
     report_period = _period(value, period or "explicit", from_, to)
+    try:
+        _safe_output_root(config, value.output.directory)
+        _safe_output_root(config, "diagnostics")
+        for member in value.members:
+            validate_local_date(member.active_from, value.period.timezone)
+            if member.active_until is not None:
+                validate_local_date(member.active_until, value.period.timezone)
+    except ValueError as exc:
+        typer.echo("Error: configured path or local date is unsafe", err=True)
+        raise typer.Exit(2) from exc
     if dry_run:
         typer.echo(json.dumps({"members": len(value.members), "period": report_period.to_json(), "sources": 6, "output": value.output.directory}, ensure_ascii=False, sort_keys=True))
         return
@@ -181,7 +214,11 @@ def collect_command(
                 files = {"resolved-config.json": resolved_bytes, "event-ledger.jsonl": ledger_bytes, "source-status.json": status_bytes, "summary.json": summary_bytes, "summary.csv": csv_bytes, "report.md": report_bytes}
                 path = write_published(_safe_output_root(config, value.output.directory), report_period.id, rid, files, manifest_base)
                 if receipt_path:
-                    _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
+                    try:
+                        _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
+                    except Exception:
+                        _remove_owned_run(path, rid)
+                        raise
                 typer.echo(f"published: {path}")
                 return
         except FileExistsError:
@@ -211,15 +248,22 @@ def collect_command(
         "source_status_summary": source_summary(status_obj), "semantic_ledger_sha256": None, "run_status": "diagnostic",
         "run_reason": reason, "publishable": False,
         "artifacts": {key: {"present": False, "sha256": None} for key in ARTIFACTS}, "diagnostic_source_status": status_obj,
-        "validator_result": {"status": "failed", "reason": "validation_failed"} if reason == "validation_failed" else {"status": "not_run", "reason": None},
+        "validator_result": {"status": "failed", "reason": "schema_invalid"} if reason == "validation_failed" else {"status": "not_run", "reason": None},
     }
-    root = _safe_output_root(config, value.output.directory)
-    diagnostics = _safe_output_root(config, "diagnostics")
-    path = write_diagnostic(diagnostics, manifest)
+    try:
+        diagnostics = _safe_output_root(config, "diagnostics")
+        path = write_diagnostic(diagnostics, manifest)
+    except Exception as exc:
+        typer.echo("Error: diagnostic artifact write failed", err=True)
+        raise typer.Exit(4) from exc
     if receipt_path:
         try:
             _write_receipt(receipt_path, report_period, rid, path, config.resolve().parent)
-        except ValueError as exc:
+        except Exception as exc:
+            try:
+                _remove_owned_run(path, rid)
+            except Exception:
+                pass
             typer.echo("Error: receipt path is unsafe", err=True)
             raise typer.Exit(4) from exc
     typer.echo(f"diagnostic: {path}", err=True)
@@ -227,7 +271,7 @@ def collect_command(
 
 
 @app.command("verify")
-def verify(run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay=False), expected_manifest_sha256: str | None = typer.Option(None, "--expected-manifest-sha256")) -> None:
+def verify(run_dir: Path = typer.Option(..., "--run-dir", file_okay=False), expected_manifest_sha256: str | None = typer.Option(None, "--expected-manifest-sha256")) -> None:
     try:
         if expected_manifest_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256):
             raise ValueError("invalid manifest hash")
@@ -243,7 +287,7 @@ def verify(run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay
 
 
 @app.command("render")
-def render(run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay=False)) -> None:
+def render(run_dir: Path = typer.Option(..., "--run-dir", file_okay=False)) -> None:
     try:
         _, code = verify_directory(run_dir)
         if code:

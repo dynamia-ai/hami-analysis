@@ -77,6 +77,10 @@ def _local_midnight(day: date, zone: ZoneInfo) -> datetime:
     return next(iter(by_offset.values()))
 
 
+def validate_local_date(day: date, timezone: str) -> None:
+    _local_midnight(day, ZoneInfo(timezone))
+
+
 def build_period(kind: str, timezone: str, *, now: datetime | None = None, start: str | None = None, end: str | None = None) -> ReportPeriod:
     zone = ZoneInfo(timezone)
     if kind == "explicit":

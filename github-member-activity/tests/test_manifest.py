@@ -11,7 +11,7 @@ from github_member_activity.canonical import canonical_json, sha256_bytes, sha25
 def test_diagnostic_manifest_has_exact_shape(tmp_path):
     statuses = source_status_object([SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "not_applicable", "member_window_empty") for source in ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")])
     manifest = {
-        "schema_version": "1.0", "run_id": "20260801t000000z-00000000-0000-4000-8000-000000000000",
+        "schema_version": "1.0", "run_id": "20260101t000000z-00000000-0000-4000-8000-000000000000",
         "run_status": "diagnostic", "publishable": False, "collector": {"version": "1.0.0", "git_commit": "0000000000000000000000000000000000000000"}, "github_rest_api_version": "2026-03-10", "period": {"id": "explicit-20260101t000000z--20260102t000000z", "timezone": "UTC", "start_local": "2026-01-01T00:00:00+00:00", "end_local": "2026-01-02T00:00:00+00:00", "start_utc": "2026-01-01T00:00:00Z", "end_utc": "2026-01-02T00:00:00Z"}, "observed_at": "2026-01-01T00:00:00Z", "publish_visibility_verified_at": None, "safe_resolved_config_sha256": None, "member_config_sha256": None, "repository_policy_summary": {"public_only": True, "first_party_owners": [], "applied_public_excluded_owner_ids": [], "applied_public_excluded_repo_ids": []}, "source_status_summary": {"core_complete": False, "optional_complete": False, "noncomplete": []}, "semantic_ledger_sha256": None, "run_reason": "no_applicable_members", "diagnostic_source_status": statuses, "validator_result": {"status": "not_run", "reason": None},
         "artifacts": {key: {"present": False, "sha256": None} for key in ("resolved_config", "event_ledger", "source_status", "summary_json", "summary_csv", "report_md")},
     }
@@ -45,7 +45,7 @@ def test_published_run_replays_and_rejects_tampering(tmp_path):
     (path / "run-manifest.json").write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     with pytest.raises(ValueError):
         verify_directory(path)
-    incomplete = [SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "partial", "api_contract_violation", False, False, False, False) if source == "prs_opened" else SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-01-03T00:00:00Z") for source in ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")]
+    incomplete = [SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "partial", "api_contract_violation") if source == "prs_opened" else SourceStatus("alice", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-01-03T00:00:00Z") for source in ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")]
     incomplete_status = source_status_object(incomplete)
     incomplete_files = dict(files)
     incomplete_files["source-status.json"] = (canonical_json(incomplete_status) + "\n").encode()

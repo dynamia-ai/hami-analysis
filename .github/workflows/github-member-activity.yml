@@ -103,13 +103,13 @@ jobs:
                   raise ValueError
               if not re.fullmatch(r'[0-9a-f]{64}', value['manifest_sha256']):
                   raise ValueError
-              print(value['run_dir'] + '|' + value['manifest_sha256'] + '|' + value['period_id'] + '|' + value['period_utc_slug'])
+              print(value['run_dir'] + '|' + value['manifest_sha256'] + '|' + value['period_id'] + '|' + value['period_utc_slug'] + '|' + value['run_id'])
           except Exception:
               sys.exit(1)
           PY
           )" || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
-          IFS='|' read -r artifact_path manifest_sha period_id period_utc_slug <<< "$receipt_values"
-          manifest_state="$(uv run python - "$artifact_path" "$manifest_sha" "$period_id" "$period_utc_slug" <<'PY'
+          IFS='|' read -r artifact_path manifest_sha period_id period_utc_slug receipt_run_id <<< "$receipt_values"
+          manifest_state="$(uv run python - "$artifact_path" "$manifest_sha" "$period_id" "$period_utc_slug" "$receipt_run_id" <<'PY'
           import hashlib, pathlib, sys
           from github_member_activity.config import load_config
           from github_member_activity.manifest import verify_directory
@@ -120,13 +120,28 @@ jobs:
           published_root = (pathlib.Path.cwd() / config.output.directory).resolve()
           diagnostic_root = (pathlib.Path.cwd() / 'diagnostics').resolve()
           resolved_path = path.resolve()
-          manifest, _ = verify_directory(path)
-          root = published_root if manifest['run_status'] == 'published' else diagnostic_root
           try:
-              resolved_path.relative_to(root)
+              published_rel = resolved_path.relative_to(published_root)
           except ValueError:
+              published_rel = None
+          try:
+              diagnostic_rel = resolved_path.relative_to(diagnostic_root)
+          except ValueError:
+              diagnostic_rel = None
+          if not ((published_rel is not None and len(published_rel.parts) == 2) or (diagnostic_rel is not None and len(diagnostic_rel.parts) == 1)):
               raise SystemExit(1)
           if any(component.is_symlink() for component in [pathlib.Path(*path.parts[:index]) for index in range(1, len(path.parts) + 1)]):
+              raise SystemExit(1)
+          manifest, _ = verify_directory(path)
+          if manifest['run_id'] != sys.argv[5]:
+              raise SystemExit(1)
+          if manifest['run_status'] == 'published':
+              if published_rel is None or published_rel.parts != (manifest['period']['id'], manifest['run_id']):
+                  raise SystemExit(1)
+          elif manifest['run_status'] == 'diagnostic':
+              if diagnostic_rel is None or diagnostic_rel.parts != (manifest['run_id'],):
+                  raise SystemExit(1)
+          else:
               raise SystemExit(1)
           digest = hashlib.sha256((path / 'run-manifest.json').read_bytes()).hexdigest()
           if digest != sys.argv[2] or manifest['run_id'] != path.name or manifest['period']['id'] != sys.argv[3] or f"{manifest['period']['start_utc'].replace('-', '').replace(':', '').replace('T', 't').replace('Z', 'z')}--{manifest['period']['end_utc'].replace('-', '').replace(':', '').replace('T', 't').replace('Z', 'z')}" != sys.argv[4]:
@@ -140,7 +155,7 @@ jobs:
           elif [ "$collector_code" = 3 ]; then
             [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ] && { [ "$manifest_reason" = 'stability_gap_not_met' ] || [ "$manifest_reason" = 'no_applicable_members' ]; } || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
           elif [ "$collector_code" = 4 ]; then
-            [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ -n "$manifest_reason" ] && [ "$manifest_reason" != 'stability_gap_not_met' ] && [ "$manifest_reason" != 'no_applicable_members' ] && { [ "$manifest_reason" = 'validation_failed' ] && [ "$manifest_validator" = 'failed' ] && [ "$manifest_validator_reason" = 'validation_failed' ] || { [ "$manifest_reason" != 'validation_failed' ] && [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ]; }; } || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
+            [ "$manifest_status" = 'diagnostic' ] && [ "$manifest_publishable" = 'False' ] && [ -n "$manifest_reason" ] && [ "$manifest_reason" != 'stability_gap_not_met' ] && [ "$manifest_reason" != 'no_applicable_members' ] && { [ "$manifest_reason" = 'validation_failed' ] && [ "$manifest_validator" = 'failed' ] && [ "$manifest_validator_reason" = 'schema_invalid' ] || { [ "$manifest_reason" != 'validation_failed' ] && [ "$manifest_validator" = 'not_run' ] && [ -z "$manifest_validator_reason" ]; }; } || { echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"; echo 'exit_code=4' >> "$GITHUB_OUTPUT"; exit 0; }
           else
             echo 'artifact_ready=false' >> "$GITHUB_OUTPUT"
             echo 'exit_code=4' >> "$GITHUB_OUTPUT"

@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from .canonical import sha256_json
-from .period import parse_rfc3339
+from .period import format_z, parse_rfc3339
 
 SCHEMA_VERSION = "1.0"
 EVENT_KINDS = ("pr_opened", "issue_opened", "issue_replied", "pr_reviewed", "pr_merged", "commit_day")
@@ -50,23 +50,31 @@ class LedgerEvent:
     def __post_init__(self) -> None:
         if any(not isinstance(value, str) or not value for value in (self.member_id, self.actor_node_id, self.subject_node_id, self.repo_node_id, self.repo_full_name, self.owner_node_id, self.owner_login, self.visibility_verified_at, self.collected_at, self.query_partition, self.evidence_url)):
             raise ValueError("ledger identifiers must be non-empty strings")
+        if self.event_node_id is not None and (not isinstance(self.event_node_id, str) or not self.event_node_id):
+            raise ValueError("event node must be a non-empty string or null")
         if not isinstance(self.quantity, int) or isinstance(self.quantity, bool):
             raise ValueError("quantity must be an integer")
-        if self.event_kind not in EVENT_KINDS or EVENT_SOURCE[self.event_kind] not in SOURCE_ORDER:
+        if not isinstance(self.event_kind, str) or self.event_kind not in EVENT_KINDS or EVENT_SOURCE[self.event_kind] not in SOURCE_ORDER:
             raise ValueError("invalid event kind")
         if self.quantity <= 0:
             raise ValueError("quantity must be positive")
+        if self.event_kind != "commit_day" and self.quantity != 1:
+            raise ValueError("ordinary event quantity must be one")
         if self.event_kind != "commit_day" and (not self.event_node_id or not self.occurred_at or self.contribution_day is not None):
             raise ValueError("invalid ordinary event shape")
         if self.event_kind == "commit_day" and (self.event_node_id is not None or self.occurred_at is not None or not self.contribution_day):
             raise ValueError("invalid commit event shape")
         if not re.fullmatch(r"^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$", self.repo_full_name) or self.owner_login != self.repo_full_name.split("/", 1)[0].lower():
             raise ValueError("invalid repository identity")
-        parse_rfc3339(self.visibility_verified_at)
-        parse_rfc3339(self.collected_at)
+        for value in (self.visibility_verified_at, self.collected_at):
+            if format_z(parse_rfc3339(value)) != value:
+                raise ValueError("ledger timestamps must be canonical UTC Z values")
         if self.occurred_at is not None:
-            parse_rfc3339(self.occurred_at)
+            if format_z(parse_rfc3339(self.occurred_at)) != self.occurred_at:
+                raise ValueError("ledger timestamps must be canonical UTC Z values")
         if self.contribution_day is not None:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", self.contribution_day):
+                raise ValueError("invalid contribution day")
             date.fromisoformat(self.contribution_day)
         if self.event_kind in {"pr_opened", "issue_opened", "pr_merged"} and self.subject_node_id != self.event_node_id:
             raise ValueError("event subject mismatch")
@@ -74,6 +82,13 @@ class LedgerEvent:
             raise ValueError("commit subject mismatch")
         if not re.fullmatch(r"(?:root|search-(?:prs_opened|issues_opened|authored_prs_merged)-[0-9]{8}t[0-9]{6}z--[0-9]{8}t[0-9]{6}z|commit-root-[0-9]{4}-[0-9]{2}-[0-9]{2}--[0-9]{4}-[0-9]{2}-[0-9]{2})", self.query_partition):
             raise ValueError("invalid query partition")
+        if self.event_kind in {"issue_replied", "pr_reviewed"} and self.query_partition != "root":
+            raise ValueError("invalid query partition for event source")
+        expected_search_partition = {"pr_opened": "search-prs_opened-", "issue_opened": "search-issues_opened-", "pr_merged": "search-authored_prs_merged-"}.get(self.event_kind)
+        if expected_search_partition is not None and not self.query_partition.startswith(expected_search_partition):
+            raise ValueError("invalid query partition for event source")
+        if self.event_kind == "commit_day" and not self.query_partition.startswith("commit-root-"):
+            raise ValueError("invalid query partition for event source")
 
     @property
     def source(self) -> str:

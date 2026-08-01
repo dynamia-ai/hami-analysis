@@ -33,11 +33,34 @@ class CommitPartitionGitHub:
         if "nameWithOwner" in query and "commitContributionsByRepository" not in query:
             return {"nodes": [{"__typename": "Repository", "id": "R1", "nameWithOwner": "dynamia-ai/demo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "dynamia-ai"}}]}
         day = variables["from"][:10]
-        has_next = self.always_next or (day == "2026-01-01" and variables["to"][:10] == "2026-01-02")
-        count = 2 if has_next else self.terminal_count
+        after = variables.get("after")
+        has_next = self.always_next or (after is None and day == "2026-01-01" and variables["to"][:10] == "2026-01-02")
+        count = 2 if day == "2026-01-01" and variables["to"][:10] == "2026-01-02" else self.terminal_count
+        edge_day = day if after is None else "2026-01-02"
         return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
             "repository": {"id": "R1", "nameWithOwner": "dynamia-ai/demo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "dynamia-ai"}},
-            "contributions": {"totalCount": count, "edges": [{"cursor": "c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"{day}T12:00:00Z", "commitCount": count, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}}], "pageInfo": {"hasNextPage": has_next, "endCursor": "c1"}},
+            "contributions": {"totalCount": count, "edges": [{"cursor": "c1" if after is None else "c2", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"{edge_day}T12:00:00Z", "commitCount": 1 if after is not None else count if not has_next else 1, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}}], "pageInfo": {"hasNextPage": has_next, "endCursor": "c1" if has_next else None}},
+        }]}}}
+
+
+class RestrictedCommitGitHub:
+    def graphql(self, query, variables):
+        if "nameWithOwner" in query and "commitContributionsByRepository" not in query:
+            raise AssertionError("restricted contribution must not be hydrated")
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
+            "repository": {"id": "R-private", "visibility": "PRIVATE", "owner": {"id": "O-private"}},
+            "contributions": {"totalCount": 999, "edges": [{"cursor": "c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": True}}], "pageInfo": {"hasNextPage": False, "endCursor": None}},
+        }]}}}
+
+
+class DuplicateCommitDayGitHub:
+    def graphql(self, query, variables):
+        if "nameWithOwner" in query and "commitContributionsByRepository" not in query:
+            raise AssertionError("duplicate day must fail before hydration")
+        node = {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": "2026-01-01T12:00:00Z", "user": {"__typename": "User", "id": "U1"}, "repository": {"id": "R1"}}
+        return {"user": {"contributionsCollection": {"commitContributionsByRepository": [{
+            "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}},
+            "contributions": {"totalCount": 3, "edges": [{"cursor": "c1", "node": {**node, "commitCount": 1}}, {"cursor": "c2", "node": {**node, "commitCount": 2}}], "pageInfo": {"hasNextPage": False, "endCursor": None}},
         }]}}}
 
 
@@ -45,7 +68,7 @@ def test_commit_inner_connection_is_repartitioned_instead_of_truncated():
     client = CommitPartitionGitHub()
     rows = _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 3, tzinfo=UTC), RepositoryPolicyConfig())
     assert [(row["repo"].node_id, row["day"]) for row in rows] == [("R1", "2026-01-01"), ("R1", "2026-01-02")]
-    assert len(client.calls) == 5
+    assert len(client.calls) == 3
 
 
 def test_commit_inner_connection_at_one_day_is_unavailable():
@@ -65,6 +88,15 @@ def test_commit_envelope_uses_effective_local_dates_for_non_utc_zone():
     _commit_snapshot(client, "Alice", "U1", datetime(2026, 1, 1, tzinfo=ZoneInfo("Asia/Shanghai")), datetime(2026, 1, 3, tzinfo=ZoneInfo("Asia/Shanghai")), RepositoryPolicyConfig())
     assert client.calls[0]["from"] == "2026-01-01T00:00:00Z"
     assert client.calls[0]["to"] == "2026-01-02T23:59:59Z"
+
+
+def test_restricted_commit_contribution_is_not_counted_or_hydrated():
+    assert _commit_snapshot(RestrictedCommitGitHub(), "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig()) == []
+
+
+def test_duplicate_commit_day_fails_before_hydration():
+    with pytest.raises(RuntimeError, match="graphql_cardinality_mismatch"):
+        _commit_snapshot(DuplicateCommitDayGitHub(), "Alice", "U1", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC), RepositoryPolicyConfig())
 
 
 def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():

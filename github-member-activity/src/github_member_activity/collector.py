@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+import re
 from typing import Any
 
 from .config import AppConfig
@@ -32,17 +33,62 @@ def _ordered_node_map(nodes: Any, ids: list[str]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _commit_group_pages(client: GitHubClient, login: str, start_day, end_day) -> tuple[list[dict[str, Any]], bool]:
+    cursor: str | None = None
+    seen_page_cursors: set[str] = set()
+    groups_by_repo: dict[str, dict[str, Any]] = {}
+    outer_capped = False
+    while True:
+        response = client.graphql(COMMIT_GROUPS_QUERY, {"login": login, "from": f"{start_day.isoformat()}T00:00:00Z", "to": f"{end_day.isoformat()}T23:59:59Z", "after": cursor})
+        groups = response.get("user", {}).get("contributionsCollection", {}).get("commitContributionsByRepository") if isinstance(response, dict) else None
+        if not isinstance(groups, list) or len(groups) > 100:
+            raise RuntimeError("commit_context_unavailable")
+        outer_capped = outer_capped or len(groups) == 100
+        page_next: list[str] = []
+        page_repo_ids: set[str] = set()
+        for group in groups:
+            repo = group.get("repository") if isinstance(group, dict) else None
+            connection = group.get("contributions") if isinstance(group, dict) else None
+            if not isinstance(repo, dict) or not isinstance(repo.get("id"), str) or not repo["id"] or not isinstance(connection, dict) or not isinstance(connection.get("edges"), list) or not isinstance(connection.get("pageInfo"), dict):
+                raise RuntimeError("api_contract_violation")
+            page_info = connection["pageInfo"]
+            if not isinstance(page_info.get("hasNextPage"), bool):
+                raise RuntimeError("api_contract_violation")
+            end_cursor = page_info.get("endCursor")
+            if end_cursor is not None and not isinstance(end_cursor, str):
+                raise RuntimeError("api_contract_violation")
+            repo_id = repo["id"]
+            if repo_id in page_repo_ids:
+                raise RuntimeError("api_contract_violation")
+            page_repo_ids.add(repo_id)
+            previous = groups_by_repo.get(repo_id)
+            if previous is None:
+                groups_by_repo[repo_id] = {"repository": repo, "contributions": {"totalCount": connection.get("totalCount"), "edges": list(connection["edges"]), "pageInfo": dict(page_info)}}
+            else:
+                if previous["repository"] != repo or previous["contributions"]["totalCount"] != connection.get("totalCount"):
+                    raise RuntimeError("api_contract_violation")
+                previous["contributions"]["edges"].extend(connection["edges"])
+                previous["contributions"]["pageInfo"] = dict(page_info)
+            if page_info["hasNextPage"]:
+                if not end_cursor:
+                    raise RuntimeError("cursor_invalid")
+                page_next.append(end_cursor)
+        if not page_next:
+            return list(groups_by_repo.values()), outer_capped
+        if len(page_next) != len(groups) or len(set(page_next)) != 1 or page_next[0] in seen_page_cursors:
+            raise RuntimeError("commit_context_unavailable")
+        seen_page_cursors.add(page_next[0])
+        cursor = page_next[0]
+
+
 def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, start: datetime, end: datetime, policy) -> list[dict[str, Any]]:
     start_day = start.date()
     end_day = (end - timedelta(seconds=1)).date()
     if end_day < start_day:
         return []
-    variables = {"login": login, "from": f"{start_day.isoformat()}T00:00:00Z", "to": f"{end_day.isoformat()}T23:59:59Z"}
-    groups = client.graphql(COMMIT_GROUPS_QUERY, variables).get("user", {}).get("contributionsCollection", {}).get("commitContributionsByRepository")
-    if not isinstance(groups, list) or len(groups) > 100:
-        raise RuntimeError("commit_context_unavailable")
+    groups, outer_capped = _commit_group_pages(client, login, start_day, end_day)
     repo_ids: set[str] = set()
-    needs_partition = len(groups) == 100
+    needs_partition = outer_capped
     for group in groups:
         repo = group.get("repository") if isinstance(group, dict) else None
         connection = group.get("contributions") if isinstance(group, dict) else None
@@ -58,11 +104,8 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
             raise RuntimeError("api_contract_violation")
         if page_info["hasNextPage"] and not page_info.get("endCursor"):
             raise RuntimeError("cursor_invalid")
-        # The contribution connection belongs to each outer repository group,
-        # but GraphQL does not expose a cursor that can be supplied separately
-        # for every group in one query.  Repartition the whole time range until
-        # every group is terminal; never silently accept a truncated group.
-        needs_partition = needs_partition or page_info["hasNextPage"]
+        if page_info["hasNextPage"]:
+            raise RuntimeError("commit_context_unavailable")
     if needs_partition:
         day_count = (end_day - start_day).days + 1
         if day_count <= 1:
@@ -94,19 +137,36 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
         if not isinstance(repo_id, str) or not isinstance(owner, dict) or not isinstance(owner.get("id"), str) or repo.get("visibility") not in {"PUBLIC", "PRIVATE", "INTERNAL"}:
             raise RuntimeError("api_contract_violation")
         contribution_total = 0
+        restricted_seen = False
         seen_cursors: set[str] = set()
+        seen_days: set[tuple[str, str]] = set()
         for edge in connection["edges"]:
             node = edge.get("node") if isinstance(edge, dict) else None
-            user = node.get("user") if isinstance(node, dict) else None
-            if not isinstance(edge, dict) or not isinstance(edge.get("cursor"), str) or not edge["cursor"] or edge["cursor"] in seen_cursors or not isinstance(node, dict) or node.get("__typename") != "CreatedCommitContribution" or node.get("isRestricted") is not False or not isinstance(node.get("occurredAt"), str) or not isinstance(node.get("commitCount"), int) or isinstance(node.get("commitCount"), bool) or node["commitCount"] <= 0 or not isinstance(user, dict) or user.get("__typename") != "User" or user.get("id") != member_node_id or not isinstance(node.get("repository"), dict) or node["repository"].get("id") != repo_id:
+            if not isinstance(edge, dict) or not isinstance(edge.get("cursor"), str) or not edge["cursor"] or edge["cursor"] in seen_cursors or not isinstance(node, dict) or node.get("__typename") != "CreatedCommitContribution" or not isinstance(node.get("isRestricted"), bool):
                 raise RuntimeError("api_contract_violation")
             seen_cursors.add(edge["cursor"])
-            occurred = parse_rfc3339(node["occurredAt"])
-            day = occurred.date().isoformat()
+            if node["isRestricted"]:
+                restricted_seen = True
+                continue
+            user = node.get("user")
+            if not isinstance(node.get("occurredAt"), str) or not isinstance(node.get("commitCount"), int) or isinstance(node.get("commitCount"), bool) or node["commitCount"] <= 0 or not isinstance(user, dict) or user.get("__typename") != "User" or user.get("id") != member_node_id or not isinstance(node.get("repository"), dict) or node["repository"].get("id") != repo_id:
+                raise RuntimeError("api_contract_violation")
+            parse_rfc3339(node["occurredAt"])
+            day = node["occurredAt"][:10]
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                raise RuntimeError("api_contract_violation")
+            try:
+                date.fromisoformat(day)
+            except ValueError:
+                raise RuntimeError("api_contract_violation") from None
+            day_key = (repo_id, day)
+            if day_key in seen_days:
+                raise RuntimeError("graphql_cardinality_mismatch")
+            seen_days.add(day_key)
             if repo.get("visibility") == "PUBLIC" and start_day.isoformat() <= day <= end_day.isoformat():
                 result.append({"repo_id": repo_id, "day": day, "quantity": node["commitCount"]})
             contribution_total += node["commitCount"]
-        if contribution_total != connection["totalCount"]:
+        if not restricted_seen and contribution_total != connection["totalCount"]:
             raise RuntimeError("api_contract_violation")
     public_repo_ids = list(dict.fromkeys(row["repo_id"] for row in result))
     if not public_repo_ids:
@@ -216,11 +276,11 @@ query($id:ID!, $after:String) {
 """
 
 COMMIT_GROUPS_QUERY = """
-query($login:String!, $from:DateTime!, $to:DateTime!) {
+query($login:String!, $from:DateTime!, $to:DateTime!, $after:String) {
   user(login:$login) { contributionsCollection(from:$from, to:$to) {
     commitContributionsByRepository(maxRepositories:100) {
       repository { id visibility owner { id } }
-      contributions(first:100, after:null) { totalCount edges { cursor node { __typename isRestricted occurredAt commitCount user { __typename id } repository { id } } } pageInfo { hasNextPage endCursor } }
+      contributions(first:100, after:$after) { totalCount edges { cursor node { __typename isRestricted occurredAt commitCount user { __typename id } repository { id } } } pageInfo { hasNextPage endCursor } }
     }
   } }
 }
@@ -267,13 +327,20 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         for index, row in enumerate(statuses):
             if row.member_id == member_id and row.source == source:
                 complete = status == "complete"
-                if source == "commit_context" and not complete:
-                    pagination = partition = snapshot = visibility = timestamp = None
+                if complete:
+                    pagination = True
+                    partition = None if source in {"issue_replies", "prs_reviewed"} else True
+                    snapshot = visibility = True
+                    timestamp = format_z(finished or observed_at)
                 else:
-                    pagination = True if complete else False
-                    partition = None if source in {"issue_replies", "prs_reviewed"} else (True if complete else False)
-                    snapshot = visibility = True if complete else False
-                    timestamp = format_z(finished or observed_at) if complete else None
+                    timestamp = None
+                    if status in {"not_applicable", "not_run"} or reason in {"identity_resolution_failed", "identity_node_mismatch", "identity_type_mismatch", "identity_login_mismatch", "authentication_failed"} or source == "commit_context":
+                        pagination = partition = snapshot = visibility = None
+                    else:
+                        pagination = False
+                        partition = None if source in {"issue_replies", "prs_reviewed"} else False
+                        snapshot = False
+                        visibility = None
                 statuses[index] = SourceStatus(member_id, source, row.criticality, status, reason, pagination, partition, snapshot, visibility, timestamp)
                 return
 
@@ -291,12 +358,18 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 raise RuntimeError("identity_login_mismatch")
         except Exception as exc:
             reason = getattr(exc, "args", ["identity_resolution_failed"])[0]
-            if reason not in {"identity_type_mismatch", "identity_node_mismatch", "identity_login_mismatch"}:
+            if reason not in {"identity_type_mismatch", "identity_node_mismatch", "identity_login_mismatch", "authentication_failed"}:
                 reason = "identity_resolution_failed"
             for source in ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context"):
                 for index, row in enumerate(statuses):
                     if row.member_id == member.member_id and row.source == source:
                         statuses[index] = SourceStatus(member.member_id, source, row.criticality, "failed", reason)
+            if reason == "authentication_failed":
+                applicable_ids = {item.member_id for item in config.members if effective_window(period, item.active_from, item.active_until) is not None}
+                for index, row in enumerate(statuses):
+                    if row.member_id in applicable_ids:
+                        statuses[index] = SourceStatus(row.member_id, row.source, row.criticality, "failed", "authentication_failed")
+                break
             continue
 
         start, end = window
