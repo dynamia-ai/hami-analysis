@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -24,6 +25,21 @@ def _git_text(directory: Path, *arguments: str) -> str | None:
     return result.stdout.strip()
 
 
+def _git_bytes(directory: Path, *arguments: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=False,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout
+
+
 def _git_output(directory: Path, *arguments: str) -> str | None:
     output = _git_text(directory, *arguments)
     return output or None
@@ -41,20 +57,24 @@ def capture_worktree_snapshot(directory: Path) -> dict[str, object] | None:
         # identity.  Treat it as uncapturable so the caller marks collection
         # partial instead of emitting an unverifiable success-looking digest.
         return None
-    tracked_diff = _git_text(root_path, "diff", "--binary", "HEAD")
-    untracked = _git_text(root_path, "ls-files", "--others", "--exclude-standard")
+    tracked_diff = _git_bytes(root_path, "diff", "--binary", "HEAD")
+    untracked = _git_bytes(root_path, "ls-files", "--others", "--exclude-standard", "-z")
     status = _git_text(root_path, "status", "--porcelain=v1")
     if tracked_diff is None or untracked is None or status is None:
         return None
     untracked_hashes: list[dict[str, str]] = []
-    for relative in sorted(filter(None, untracked.splitlines())):
+    relative_paths = sorted(
+        (os.fsdecode(raw_path) for raw_path in untracked.split(b"\0") if raw_path),
+        key=os.fsencode,
+    )
+    for relative in relative_paths:
         path = root_path / relative
         if path.is_file():
             digest = _sha256(path)
             if digest is None:
                 return None
             untracked_hashes.append({"path": relative, "sha256": digest})
-    tracked_diff_sha256 = hashlib.sha256(tracked_diff.encode("utf-8")).hexdigest()
+    tracked_diff_sha256 = hashlib.sha256(tracked_diff).hexdigest()
     untracked_sha256 = _normalized_json_sha256(untracked_hashes)
     dirty = bool(status)
     return {

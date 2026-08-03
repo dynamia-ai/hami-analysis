@@ -7,6 +7,7 @@ import argparse
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -296,6 +297,21 @@ def _git_text(directory: Path, *arguments: str) -> str | None:
     return result.stdout.strip()
 
 
+def _git_bytes(directory: Path, *arguments: str) -> bytes | None:
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=False,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout
+
+
 def _git_provenance(directory: Path) -> dict[str, object] | None:
     root = _git_output(directory, "rev-parse", "--show-toplevel")
     if root is None:
@@ -303,16 +319,20 @@ def _git_provenance(directory: Path) -> dict[str, object] | None:
     root_path = Path(root)
     head = _git_output(root_path, "rev-parse", "HEAD")
     status = _git_text(root_path, "status", "--porcelain=v1")
-    tracked_diff = _git_text(root_path, "diff", "--binary", "HEAD")
-    untracked = _git_text(root_path, "ls-files", "--others", "--exclude-standard")
+    tracked_diff = _git_bytes(root_path, "diff", "--binary", "HEAD")
+    untracked = _git_bytes(root_path, "ls-files", "--others", "--exclude-standard", "-z")
     if head is None or status is None or tracked_diff is None or untracked is None:
         return None
     untracked_hashes: list[dict[str, str]] = []
-    for relative in sorted(filter(None, untracked.splitlines())):
+    relative_paths = sorted(
+        (os.fsdecode(raw_path) for raw_path in untracked.split(b"\0") if raw_path),
+        key=os.fsencode,
+    )
+    for relative in relative_paths:
         path = root_path / relative
         if path.is_file():
             untracked_hashes.append({"path": relative, "sha256": _sha256(path)})
-    tracked_diff_sha256 = hashlib.sha256(tracked_diff.encode("utf-8")).hexdigest()
+    tracked_diff_sha256 = hashlib.sha256(tracked_diff).hexdigest()
     untracked_sha256 = hashlib.sha256(
         json.dumps(untracked_hashes, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).hexdigest()
