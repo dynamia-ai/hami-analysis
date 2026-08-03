@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 
@@ -25,6 +26,7 @@ def test_clean_commits_have_distinct_worktree_snapshot_digests(tmp_path: Path) -
     _git(repository, "config", "user.name", "Collector Test")
     _git(repository, "config", "commit.gpgsign", "false")
     _git(repository, "config", "core.hooksPath", "")
+    _git(repository, "config", "core.quotePath", "false")
 
     source = repository / "source.py"
     source.write_text("VERSION = 1\n", encoding="utf-8")
@@ -63,6 +65,9 @@ def test_snapshot_hashes_raw_diff_bytes_and_preserves_newline_filenames(tmp_path
     source.write_text("VERSION = 2\n", encoding="utf-8")
     newline_path = repository / "untracked\nname.txt"
     newline_path.write_text("untracked", encoding="utf-8")
+    raw_name = b"untracked-\xff.txt"
+    non_utf8_path = repository / os.fsdecode(raw_name)
+    non_utf8_path.write_bytes(b"non-utf8")
 
     snapshot = capture_worktree_snapshot(repository)
     assert snapshot is not None
@@ -74,3 +79,4 @@ def test_snapshot_hashes_raw_diff_bytes_and_preserves_newline_filenames(tmp_path
     ).stdout
     assert snapshot["tracked_diff_sha256"] == hashlib.sha256(raw_diff).hexdigest()
     assert any(item["path"] == "untracked\nname.txt" for item in snapshot["untracked"])
+    assert any(os.fsencode(item["path"]) == raw_name for item in snapshot["untracked"])

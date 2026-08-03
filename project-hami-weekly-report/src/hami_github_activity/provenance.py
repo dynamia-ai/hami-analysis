@@ -59,7 +59,7 @@ def capture_worktree_snapshot(directory: Path) -> dict[str, object] | None:
         return None
     tracked_diff = _git_bytes(root_path, "diff", "--binary", "HEAD")
     untracked = _git_bytes(root_path, "ls-files", "--others", "--exclude-standard", "-z")
-    status = _git_text(root_path, "status", "--porcelain=v1")
+    status = _git_bytes(root_path, "status", "--porcelain=v1")
     if tracked_diff is None or untracked is None or status is None:
         return None
     untracked_hashes: list[dict[str, str]] = []
