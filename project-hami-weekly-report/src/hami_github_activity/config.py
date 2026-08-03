@@ -89,10 +89,16 @@ def output_path(config_path: Path, template: str, *, org: str, start_date: str, 
         raise ValueError("output file must be a relative path under output/")
 
     config_root = config_path.resolve().parent
-    output_root = (config_root / "output").resolve()
+    output_root = config_root / "output"
+    if output_root.is_symlink():
+        raise ValueError("output directory must not be a symbolic link")
+    if output_root.exists() and not output_root.is_dir():
+        raise ValueError("output path must be a directory")
     resolved = (config_root / path).resolve()
     try:
         resolved.relative_to(output_root)
     except ValueError as exc:
         raise ValueError("output file must be under the config directory's output/") from exc
+    if resolved == output_root:
+        raise ValueError("output file must be a file below the output directory")
     return resolved

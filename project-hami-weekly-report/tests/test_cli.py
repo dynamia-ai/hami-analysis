@@ -180,4 +180,7 @@ def test_collect_degrades_when_inventory_and_provenance_are_unavailable(
     assert result.exit_code == 0
     outputs = list((tmp_path / "output").glob("*.md"))
     assert len(outputs) == 1
-    assert "partial" in outputs[0].read_text(encoding="utf-8")
+    content = outputs[0].read_text(encoding="utf-8")
+    assert 'collection_status: "partial"' in content
+    assert "repository inventory pagination was incomplete" in content
+    assert "collector worktree snapshot could not be captured at collection start" in content

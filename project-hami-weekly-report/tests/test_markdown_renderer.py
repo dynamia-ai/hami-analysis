@@ -10,6 +10,7 @@ from hami_github_activity.markdown_renderer import (
     UNKNOWN_ACTIVITY_MESSAGE,
     _current_reviews,
     _scalar,
+    _text_scalar,
     render_markdown,
     truncate,
     write_markdown,
@@ -52,7 +53,8 @@ def test_write_markdown_cleans_temporary_file_when_replace_fails(
 
 
 def test_scalar_escapes_markdown_emphasis_characters() -> None:
-    assert _scalar("asterisk * and underscore _") == "asterisk &#42; and underscore &#95;"
+    assert _scalar("asterisk * and underscore _") == "asterisk * and underscore _"
+    assert _text_scalar("asterisk * and underscore _") == "asterisk &#42; and underscore &#95;"
 
 
 def issue(body: str = "body", title: str = "A | title") -> IssueEvidence:
@@ -245,7 +247,7 @@ def test_pr_freshness_fields_distinguish_collected_and_unknown_state() -> None:
     content = render_markdown(org="Project-HAMi", period=PERIOD, result=CollectionResult(pull_requests=[item]))
 
     assert "Head SHA: `abc123`" in content
-    assert "Latest review state per reviewer: `maintainer:CHANGES&#95;REQUESTED`" in content
+    assert "Latest review state per reviewer: `maintainer:CHANGES_REQUESTED`" in content
     assert "Unresolved review thread count: `not collected by this REST collector`" in content
 
 

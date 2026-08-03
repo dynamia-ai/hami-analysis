@@ -21,6 +21,7 @@ from hami_github_activity.models import (
 
 
 logger = logging.getLogger(__name__)
+ACTIVITY_FAILURE_PREFIX = "Could not collect activity "
 
 
 class ActivityCollector:
@@ -191,7 +192,7 @@ class ActivityCollector:
 
     @staticmethod
     def _activity_collection_failed(item: IssueEvidence | PullRequestEvidence) -> bool:
-        return any(gap.startswith("Could not collect activity ") for gap in item.data_gaps)
+        return any(gap.startswith(ACTIVITY_FAILURE_PREFIX) for gap in item.data_gaps)
 
     @staticmethod
     def _candidate_id(candidate: dict[str, Any]) -> str:
@@ -437,7 +438,7 @@ class ActivityCollector:
             raw = page_result.items
             if page_result.incomplete:
                 message = (
-                    f"Could not collect page {page_result.failed_page} of {kind} data: "
+                    f"{ACTIVITY_FAILURE_PREFIX}{kind} page {page_result.failed_page}: "
                     f"{page_result.partial_error}"
                 )
                 data_gaps.append(message)
@@ -445,14 +446,14 @@ class ActivityCollector:
                 self._mark_partial(f"{scope}: {kind} pagination incomplete")
             if page_result.malformed_item_count:
                 message = (
-                    f"Could not collect {page_result.malformed_item_count} non-object "
-                    f"{kind} record(s) returned by GitHub."
+                    f"{ACTIVITY_FAILURE_PREFIX}{kind} returned "
+                    f"{page_result.malformed_item_count} non-object record(s)."
                 )
                 data_gaps.append(message)
                 self._warn(scope, message)
                 self._mark_partial(f"{scope}: {kind} pagination malformed response items")
         except GitHubRequestError as exc:
-            message = f"Could not collect activity {kind} data: {exc}"
+            message = f"{ACTIVITY_FAILURE_PREFIX}{kind} data: {exc}"
             data_gaps.append(message)
             self._warn(scope, message, exc.url)
             self._mark_partial(f"{scope}: {kind} request failed")

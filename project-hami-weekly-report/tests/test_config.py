@@ -40,9 +40,12 @@ def test_output_template_rejects_unknown_or_advanced_placeholders(tmp_path: Path
         output_path(tmp_path / "config.yaml", "{org!r}.md", org="o", start_date="s", end_date="e")
 
 
-@pytest.mark.parametrize("template", ["reports/report.md", "../report.md", "/tmp/report.md"])
+@pytest.mark.parametrize(
+    "template",
+    ["reports/report.md", "../report.md", "/tmp/report.md", "output", "output/", "output/."],
+)
 def test_output_template_must_stay_under_ignored_output_directory(tmp_path: Path, template: str) -> None:
-    with pytest.raises(ValueError, match="under.*output/"):
+    with pytest.raises(ValueError, match="output"):
         output_path(tmp_path / "config.yaml", template, org="o", start_date="s", end_date="e")
 
 
@@ -84,3 +87,12 @@ def test_expected_repositories_are_trimmed_sorted_and_unique() -> None:
             token_env="GITHUB_TOKEN",
             expected_repositories=["Project-HAMi/A", " Project-HAMi/A"],
         )
+
+
+def test_output_root_symbolic_link_is_rejected(tmp_path: Path) -> None:
+    tracked = tmp_path / "tracked"
+    tracked.mkdir()
+    (tmp_path / "output").symlink_to(tracked, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        output_path(tmp_path / "config.yaml", "output/report.md", org="o", start_date="s", end_date="e")

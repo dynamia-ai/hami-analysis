@@ -42,8 +42,6 @@ def _scalar(value: object, *, empty: str = "Not provided") -> str:
         .replace(">", "&gt;")
         .replace("\\", "&#92;")
         .replace("`", "&#96;")
-        .replace("*", "&#42;")
-        .replace("_", "&#95;")
         .replace("[", "&#91;")
         .replace("]", "&#93;")
         .replace("(", "&#40;")
@@ -52,12 +50,17 @@ def _scalar(value: object, *, empty: str = "Not provided") -> str:
     )
 
 
+def _text_scalar(value: object, *, empty: str = "Not provided") -> str:
+    """Render untrusted text outside code spans without enabling emphasis."""
+    return _scalar(value, empty=empty).replace("*", "&#42;").replace("_", "&#95;")
+
+
 def _list(values: list[str]) -> str:
-    return ", ".join(_scalar(value) for value in values) if values else "None"
+    return ", ".join(_text_scalar(value) for value in values) if values else "None"
 
 
 def _table(value: str | None) -> str:
-    return _scalar(value, empty="None")
+    return _text_scalar(value, empty="None")
 
 
 def truncate(value: str, limit: int) -> tuple[str, bool]:
@@ -186,7 +189,7 @@ def _issue_block(issue: IssueEvidence) -> str:
 
 #### Metadata
 
-- Title: {_scalar(issue.title)}
+- Title: {_text_scalar(issue.title)}
 - URL: {_scalar(issue.url)}
 - State: `{_scalar(issue.state)}`
 - State reason: `{_scalar(issue.state_reason)}`
@@ -210,7 +213,7 @@ def _issue_block(issue: IssueEvidence) -> str:
 
 - Labels: {_list(issue.labels)}
 - Assignees: {_list(issue.assignees)}
-- Milestone: {_scalar(issue.milestone, empty='None')}
+- Milestone: {_text_scalar(issue.milestone, empty='None')}
 
 #### Body
 
@@ -240,7 +243,7 @@ def _issue_block(issue: IssueEvidence) -> str:
 
 #### Data Gaps
 
-{chr(10).join(f'- {_scalar(gap)}' for gap in gaps) if gaps else 'None.'}
+{chr(10).join(f'- {_text_scalar(gap)}' for gap in gaps) if gaps else 'None.'}
 
 <!-- ITEM_END issue {issue.item_id} -->"""
 
@@ -282,7 +285,7 @@ def _pr_block(pr: PullRequestEvidence) -> str:
 
 #### Metadata
 
-- Title: {_scalar(pr.title)}
+- Title: {_text_scalar(pr.title)}
 - URL: {_scalar(pr.url)}
 - State: `{_scalar(pr.state)}`
 - Draft: `{_yes(pr.draft)}`
@@ -326,7 +329,7 @@ def _pr_block(pr: PullRequestEvidence) -> str:
 - Labels: {_list(pr.labels)}
 - Assignees: {_list(pr.assignees)}
 - Requested reviewers: {_list(pr.requested_reviewers)}
-- Milestone: {_scalar(pr.milestone, empty='None')}
+- Milestone: {_text_scalar(pr.milestone, empty='None')}
 
 #### Change Size
 
@@ -382,7 +385,7 @@ def _pr_block(pr: PullRequestEvidence) -> str:
 
 #### Data Gaps
 
-{chr(10).join(f'- {_scalar(gap)}' for gap in gaps) if gaps else 'None.'}
+{chr(10).join(f'- {_text_scalar(gap)}' for gap in gaps) if gaps else 'None.'}
 
 <!-- ITEM_END pull_request {pr.item_id} -->"""
 
@@ -398,7 +401,7 @@ def render_markdown(
     issue_index = "\n".join(f"| {_issue_index(issue)} |" for issue in result.issues)
     pr_index = "\n".join(f"| {_pr_index(pr)} |" for pr in result.pull_requests)
     warnings = "\n".join(
-        f"- **{_scalar(warning.scope)}**: {_scalar(warning.message)}"
+        f"- **{_text_scalar(warning.scope)}**: {_text_scalar(warning.message)}"
         + (f" ([request]({_scalar(warning.url)}))" if warning.url else "")
         for warning in result.warnings
     ) or "None."

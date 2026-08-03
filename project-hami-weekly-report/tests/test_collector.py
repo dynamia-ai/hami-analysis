@@ -4,6 +4,8 @@ from threading import Lock
 from time import sleep
 from typing import Any
 
+import pytest
+
 from hami_github_activity.collector import ActivityCollector
 from hami_github_activity.date_range import build_scan_period
 from hami_github_activity.github_client import GitHubRequestError, PaginatedResult, SearchResult
@@ -257,6 +259,56 @@ def test_activity_endpoint_failure_has_separate_exclusion_count() -> None:
     assert result.unexplained_updated_excluded_count == 0
     assert result.activity_failure_excluded_count == 1
     assert result.warnings[0].scope == "issue:Project-HAMi/HAMi#19"
+
+
+@pytest.mark.parametrize(
+    "page_result",
+    [
+        PaginatedResult(items=[], incomplete=True, failed_page=2, partial_error="later page failed"),
+        PaginatedResult(items=[], malformed_item_count=1),
+    ],
+)
+def test_activity_page_failures_are_not_unexplained_updated_exclusions(
+    page_result: PaginatedResult,
+) -> None:
+    class ActivityFailureClient(FakeClient):
+        def get_paginated_result(self, path: str, **_: Any) -> PaginatedResult:
+            assert path.endswith("/comments")
+            return page_result
+
+    client = ActivityFailureClient([candidate(21)], [])
+    client.details["/repos/Project-HAMi/HAMi/issues/21"] = issue_detail(
+        21,
+        created_at="2026-06-01T00:00:00Z",
+        updated_at="2026-07-12T00:00:00Z",
+    )
+    result = ActivityCollector(client, PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    assert result.issues == []
+    assert result.activity_failure_excluded_count == 1
+    assert result.unexplained_updated_excluded_count == 0
+
+
+def test_head_commit_failure_remains_distinct_from_activity_failure() -> None:
+    class HeadFailureClient(FakeClient):
+        def get_json(self, path: str, **kwargs: Any) -> dict[str, Any]:
+            if path.endswith("/commits/abc123"):
+                raise GitHubRequestError("commit unavailable", url=path)
+            return super().get_json(path, **kwargs)
+
+    client = HeadFailureClient([], [candidate(22)])
+    client.details["/repos/Project-HAMi/HAMi/pulls/22"] = pr_detail(
+        22,
+        created_at="2026-06-01T00:00:00Z",
+        updated_at="2026-07-12T00:00:00Z",
+        head={"ref": "fix", "sha": "abc123"},
+    )
+    collector = ActivityCollector(client, PERIOD)
+    item = collector._collect_pull_request(client.pr_candidates[0])
+
+    assert item is not None
+    assert any(gap.startswith("Could not collect provenance head commit metadata") for gap in item.data_gaps)
+    assert not collector._activity_collection_failed(item)
 
 
 def test_collection_logs_search_and_item_progress(caplog: object) -> None:

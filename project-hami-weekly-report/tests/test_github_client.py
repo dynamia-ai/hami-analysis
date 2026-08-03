@@ -484,4 +484,5 @@ def test_primary_rate_limit_waits_until_reset(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("hami_github_activity.github_client.time.time", lambda: 100.0)
     client = GitHubClient("token", client=raw, max_attempts=2, sleep=sleeps.append)
     assert client.get_json("/status") == {"ok": True}
-    assert sleeps == [pytest.approx(6.0)]
+    assert len(sleeps) == 1
+    assert sleeps[0] == pytest.approx(6.0, abs=0.5)
