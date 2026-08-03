@@ -2,7 +2,7 @@ from pathlib import Path
 
 import hami_github_activity.cli as cli_module
 from hami_github_activity.models import CollectionResult
-from hami_github_activity.github_client import PaginatedResult
+from hami_github_activity.github_client import GitHubRequestError, PaginatedResult
 from typer.testing import CliRunner
 
 from hami_github_activity.cli import app
@@ -144,3 +144,40 @@ def test_repository_visibility_rejects_non_object_inventory_entries() -> None:
 
     assert result.collection_status == "partial"
     assert "repository inventory returned 1 non-object entries" in result.partial_reasons
+
+
+def test_collect_degrades_when_inventory_and_provenance_are_unavailable(
+    tmp_path: Path, monkeypatch: object
+) -> None:
+    path = tmp_path / "config.yaml"
+    write_config(path)
+
+    class DummyClient:
+        def __init__(self, _: str, **__: object) -> None:
+            pass
+
+        def __enter__(self) -> "DummyClient":
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def list_org_repositories(self, _: str) -> PaginatedResult:
+            raise GitHubRequestError("inventory unavailable", url="https://api.github.test/repos")
+
+    class DummyCollector:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def collect(self, _: str) -> CollectionResult:
+            return CollectionResult()
+
+    monkeypatch.setattr(cli_module, "GitHubClient", DummyClient)  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli_module, "ActivityCollector", DummyCollector)  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli_module, "capture_worktree_snapshot", lambda _: None)  # type: ignore[attr-defined]
+    result = runner.invoke(app, ["collect", "--config", str(path)], env={"TEST_GITHUB_TOKEN": "token"})
+
+    assert result.exit_code == 0
+    outputs = list((tmp_path / "output").glob("*.md"))
+    assert len(outputs) == 1
+    assert "partial" in outputs[0].read_text(encoding="utf-8")

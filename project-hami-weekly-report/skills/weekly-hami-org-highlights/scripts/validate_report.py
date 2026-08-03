@@ -470,8 +470,14 @@ def _evidence_items(content: str) -> dict[tuple[str, int], tuple[str, str]]:
         id_match = CANONICAL_LABEL_RE.fullmatch(item_id)
         if id_match is None:
             continue
-        next_marker = EVIDENCE_ITEM_RE.search(content, match.end())
-        block = content[match.end() : next_marker.start() if next_marker else len(content)]
+        end_marker = re.search(
+            rf"^<!-- ITEM_END {re.escape(match.group('kind'))} {re.escape(item_id)} -->[ \t]*$",
+            content[match.end() :],
+            re.MULTILINE,
+        )
+        if end_marker is None:
+            continue
+        block = content[match.end() : match.end() + end_marker.start()]
         url_match = EVIDENCE_URL_RE.search(block)
         if url_match is None:
             continue

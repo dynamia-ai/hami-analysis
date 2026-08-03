@@ -170,10 +170,10 @@ def _run(
     input_report = tmp_path / "pre-tech-doc-report.md"
     polish_review = tmp_path / "polish-review.json"
     output = tmp_path / "manifest.json"
-    evidence.write_text(evidence_content)
-    report.write_text(VALID_REPORT)
-    input_report.write_text(VALID_REPORT)
-    ledger_path.write_text(ledger)
+    evidence.write_text(evidence_content, encoding="utf-8")
+    report.write_text(VALID_REPORT, encoding="utf-8")
+    input_report.write_text(VALID_REPORT, encoding="utf-8")
+    ledger_path.write_text(ledger, encoding="utf-8")
     index_trace.write_text(
         json.dumps(
             {
@@ -196,7 +196,8 @@ def _run(
                 "item_ids": ["Project-HAMi/HAMi#2"],
             }
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
     candidate_pool.write_text(
         json.dumps(
@@ -211,12 +212,13 @@ def _run(
                     {"id": "Project-HAMi/HAMi#4", "kind": "issue"},
                 ],
             }
-        )
+        ),
+        encoding="utf-8",
     )
     style_skill.parent.mkdir()
-    style_skill.write_text("---\nname: tech-doc-style-chinese\n---\n")
+    style_skill.write_text("---\nname: tech-doc-style-chinese\n---\n", encoding="utf-8")
     lint_script.parent.mkdir()
-    lint_script.write_text("import sys\nsys.exit(0)\n")
+    lint_script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
     polish_review.write_text(
         json.dumps(
             {
@@ -235,7 +237,8 @@ def _run(
                 "report": {"sha256": style_report_sha256 or _sha256(report)},
                 "scope": {},
             }
-        )
+        ),
+        encoding="utf-8",
     )
     return subprocess.run(
         [
@@ -267,7 +270,7 @@ def _reader_view_output_bytes(
 ) -> int:
     evidence = tmp_path / "measurement" / "evidence.md"
     evidence.parent.mkdir()
-    evidence.write_text(evidence_content)
+    evidence.write_text(evidence_content, encoding="utf-8")
     total = 0
     chunk = 1
     while True:

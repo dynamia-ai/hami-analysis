@@ -30,18 +30,6 @@ def render(input_path: Path, output_path: Path) -> None:
     text = input_path.read_text(encoding="utf-8")
     text = SOURCE_LINK_RE.sub(_canonical_source, text)
     text = SHORT_LINK_RE.sub(_canonical_short, text)
-    text = text.replace(
-        "actor=`human`, in_period=`yes`, evidence=`bounded PR triage card`; [Project-HAMi/HAMi#1773]",
-        "actor=`human`（含 member activity）, in_period=`yes`, evidence=`bounded PR triage card`; [Project-HAMi/HAMi#1773]",
-    )
-    text = text.replace(
-        "actor=`human`, in_period=`yes`, evidence=`bounded issue/PR triage cards`; [Project-HAMi/HAMi#1773]",
-        "actor=`human`（含 member activity）, in_period=`yes`, evidence=`bounded issue/PR triage cards`; [Project-HAMi/HAMi#1773]",
-    )
-    text = text.replace(
-        "设备支持矩阵文档适合保持轻量维护",
-        "零设备请求的 panic 修复适合保持轻量维护",
-    )
     output_path.write_text(text, encoding="utf-8")
 
 

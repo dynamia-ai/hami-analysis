@@ -338,9 +338,9 @@ def _print_index(
 
     payload += "".join(selected)
     output = _envelope(payload, source=path, view="index", kind=kind)
-    sys.stdout.write(output)
     if trace is not None:
         _append_index_trace(trace, path, kind, offset, selected)
+    sys.stdout.write(output)
     first = offset + 1 if selected else 0
     last = offset + len(selected)
     message = f"items {first}-{last} of {len(rows)}; output bytes: {_encoded_size(output)}"
@@ -454,6 +454,47 @@ def _chunks(text: str, max_bytes: int) -> list[str]:
     return chunks or [""]
 
 
+def _bounded_chunks(
+    text: str,
+    max_bytes: int,
+    *,
+    source: Path,
+    kind: str,
+    item_id: str,
+    view: str,
+) -> list[str]:
+    """Split payloads again when the dynamic Markdown fence consumes headroom."""
+    chunks = _chunks(text, max_bytes - ENVELOPE_RESERVE_BYTES)
+    while True:
+        chunk_count = len(chunks)
+        oversized = next(
+            (
+                index
+                for index, chunk in enumerate(chunks)
+                if _encoded_size(
+                    _envelope(
+                        chunk,
+                        source=source,
+                        kind=kind,
+                        item_id=item_id,
+                        view=view,
+                        chunk_number=index + 1,
+                        chunk_count=chunk_count,
+                    )
+                )
+                > max_bytes
+            ),
+            None,
+        )
+        if oversized is None:
+            return chunks
+        chunk = chunks[oversized]
+        if len(chunk) <= 1:
+            raise EvidenceError("max-bytes is too small for the untrusted evidence envelope")
+        midpoint = len(chunk) // 2
+        chunks[oversized : oversized + 1] = [chunk[:midpoint], chunk[midpoint:]]
+
+
 def _print_item(
     path: Path,
     kind: str,
@@ -476,7 +517,14 @@ def _print_item(
         output = _triage_view(block, kind)
     else:
         output = _section_view(block, kind, view)
-    chunks = _chunks(output, max_bytes - ENVELOPE_RESERVE_BYTES)
+    chunks = _bounded_chunks(
+        output,
+        max_bytes,
+        source=path,
+        kind=kind,
+        item_id=item_id,
+        view=view,
+    )
     if chunk_number > len(chunks):
         raise EvidenceError(f"chunk {chunk_number} is beyond the {len(chunks)} available chunks")
 

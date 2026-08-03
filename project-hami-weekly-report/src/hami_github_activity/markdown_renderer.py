@@ -42,6 +42,8 @@ def _scalar(value: object, *, empty: str = "Not provided") -> str:
         .replace(">", "&gt;")
         .replace("\\", "&#92;")
         .replace("`", "&#96;")
+        .replace("*", "&#42;")
+        .replace("_", "&#95;")
         .replace("[", "&#91;")
         .replace("]", "&#93;")
         .replace("(", "&#40;")

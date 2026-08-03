@@ -37,6 +37,8 @@ CLI 固定采集：
 - Issue 和 PR 当前基础状态；
 - PR 当前 `merged`、`draft`、`mergeable` 和变更规模字段。
 
+运行配置约束：`output.file` 必须是配置文件所在目录下 `output/` 的相对路径。这样 evidence、报告和其他运行产物统一落在被 Git 忽略的目录中；`config.example.yaml` 可提交，真实 `config*.yaml` 不应提交。
+
 第一版不采集 timeline events、check runs、workflow runs、head commits、resolved review threads、文件 diff、全量仓库历史和 reaction 明细。
 
 ## 环境要求

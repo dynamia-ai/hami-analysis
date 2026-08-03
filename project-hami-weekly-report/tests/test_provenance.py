@@ -22,6 +22,8 @@ def test_clean_commits_have_distinct_worktree_snapshot_digests(tmp_path: Path) -
     _git(repository, "init")
     _git(repository, "config", "user.email", "collector@example.test")
     _git(repository, "config", "user.name", "Collector Test")
+    _git(repository, "config", "commit.gpgsign", "false")
+    _git(repository, "config", "core.hooksPath", "")
 
     source = repository / "source.py"
     source.write_text("VERSION = 1\n", encoding="utf-8")

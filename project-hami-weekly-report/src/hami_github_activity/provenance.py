@@ -5,15 +5,28 @@ import json
 from pathlib import Path
 import subprocess
 
+GIT_TIMEOUT_SECONDS = 30.0
 
-def _git_output(directory: Path, *arguments: str) -> str | None:
+
+def _git_text(directory: Path, *arguments: str) -> str | None:
+    """Return command output, preserving successful empty output as ``""``."""
     try:
         result = subprocess.run(
-            ["git", *arguments], cwd=directory, check=True, capture_output=True, text=True
+            ["git", *arguments],
+            cwd=directory,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=GIT_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() or None
+    return result.stdout.strip()
+
+
+def _git_output(directory: Path, *arguments: str) -> str | None:
+    output = _git_text(directory, *arguments)
+    return output or None
 
 
 def capture_worktree_snapshot(directory: Path) -> dict[str, object] | None:
@@ -28,16 +41,22 @@ def capture_worktree_snapshot(directory: Path) -> dict[str, object] | None:
         # identity.  Treat it as uncapturable so the caller marks collection
         # partial instead of emitting an unverifiable success-looking digest.
         return None
-    tracked_diff = _git_output(root_path, "diff", "--binary", "HEAD") or ""
-    untracked = _git_output(root_path, "ls-files", "--others", "--exclude-standard") or ""
+    tracked_diff = _git_text(root_path, "diff", "--binary", "HEAD")
+    untracked = _git_text(root_path, "ls-files", "--others", "--exclude-standard")
+    status = _git_text(root_path, "status", "--porcelain=v1")
+    if tracked_diff is None or untracked is None or status is None:
+        return None
     untracked_hashes: list[dict[str, str]] = []
     for relative in sorted(filter(None, untracked.splitlines())):
         path = root_path / relative
         if path.is_file():
-            untracked_hashes.append({"path": relative, "sha256": _sha256(path)})
+            digest = _sha256(path)
+            if digest is None:
+                return None
+            untracked_hashes.append({"path": relative, "sha256": digest})
     tracked_diff_sha256 = hashlib.sha256(tracked_diff.encode("utf-8")).hexdigest()
     untracked_sha256 = _normalized_json_sha256(untracked_hashes)
-    dirty = bool(_git_output(root_path, "status", "--porcelain=v1"))
+    dirty = bool(status)
     return {
         "root": str(root_path),
         "head": head,
@@ -54,11 +73,14 @@ def capture_worktree_snapshot(directory: Path) -> dict[str, object] | None:
     }
 
 
-def _sha256(path: Path) -> str:
+def _sha256(path: Path) -> str | None:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError:
+        return None
     return digest.hexdigest()
 
 

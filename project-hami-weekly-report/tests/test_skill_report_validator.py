@@ -162,8 +162,8 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     report = tmp_path / "report.md"
     evidence_path = tmp_path / "evidence.md"
-    report.write_text(content)
-    evidence_path.write_text(evidence)
+    report.write_text(content, encoding="utf-8")
+    evidence_path.write_text(evidence, encoding="utf-8")
     return subprocess.run(
         [sys.executable, str(SCRIPT), str(report), str(evidence_path)],
         check=False,

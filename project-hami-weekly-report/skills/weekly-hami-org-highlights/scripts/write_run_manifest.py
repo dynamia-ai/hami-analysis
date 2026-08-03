@@ -52,6 +52,8 @@ POOL_FIELDS = {"schema_version", "created_at", "evidence", "index_trace", "candi
 STYLE_SKILL_NAME = "tech-doc-style-chinese"
 RISK_LEVELS = {"low", "medium", "high", "not assessed"}
 TRIAGE_MAX_BYTES = 20_000
+SUBPROCESS_TIMEOUT_SECONDS = 60.0
+MAX_PER_KIND = 24
 TRIAGE_STDERR_RE = re.compile(
     r"\Achunk (?P<chunk>[1-9]\d*)/(?P<count>[1-9]\d*); "
     r"output bytes: (?P<output_bytes>\d+); view bytes: (?P<view_bytes>\d+)"
@@ -86,7 +88,7 @@ REPORT_SECTIONS = {
     "Recommended Resource Allocation",
     "Active but Not Worth Investing This Week",
 }
-DETAIL_REPORT_SECTIONS = REPORT_SECTIONS - {"Executive Summary"}
+DETAIL_REPORT_SECTIONS = REPORT_SECTIONS
 
 
 class ManifestError(ValueError):
@@ -275,6 +277,11 @@ def _read_ledger(path: Path) -> list[dict[str, object]]:
 
 
 def _git_output(directory: Path, *arguments: str) -> str | None:
+    output = _git_text(directory, *arguments)
+    return output or None
+
+
+def _git_text(directory: Path, *arguments: str) -> str | None:
     try:
         result = subprocess.run(
             ["git", *arguments],
@@ -282,10 +289,11 @@ def _git_output(directory: Path, *arguments: str) -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.CalledProcessError):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() or None
+    return result.stdout.strip()
 
 
 def _git_provenance(directory: Path) -> dict[str, object] | None:
@@ -294,9 +302,11 @@ def _git_provenance(directory: Path) -> dict[str, object] | None:
         return None
     root_path = Path(root)
     head = _git_output(root_path, "rev-parse", "HEAD")
-    status = _git_output(root_path, "status", "--porcelain=v1") or ""
-    tracked_diff = _git_output(root_path, "diff", "--binary", "HEAD") or ""
-    untracked = _git_output(root_path, "ls-files", "--others", "--exclude-standard") or ""
+    status = _git_text(root_path, "status", "--porcelain=v1")
+    tracked_diff = _git_text(root_path, "diff", "--binary", "HEAD")
+    untracked = _git_text(root_path, "ls-files", "--others", "--exclude-standard")
+    if head is None or status is None or tracked_diff is None or untracked is None:
+        return None
     untracked_hashes: list[dict[str, str]] = []
     for relative in sorted(filter(None, untracked.splitlines())):
         path = root_path / relative
@@ -396,8 +406,9 @@ def _run_style_lint(style_skill: Path, report: Path) -> dict[str, object]:
             check=False,
             capture_output=True,
             text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ManifestError(f"could not execute Tech-Doc lint: {error}") from error
     if result.returncode != 0:
         detail = (result.stdout + "\n" + result.stderr).strip().replace("\n", "; ")[:1_000]
@@ -452,8 +463,8 @@ def _read_candidate_pool(pool: Path, evidence: Path, index_trace: Path) -> dict[
     if len(ids) != len(set(ids)):
         raise ManifestError("candidate pool contains duplicate item IDs")
     for kind, count in kind_counts.items():
-        if count > 24:
-            raise ManifestError(f"candidate pool has {count} {kind} items; maximum is 24")
+        if count > MAX_PER_KIND:
+            raise ManifestError(f"candidate pool has {count} {kind} items; maximum is {MAX_PER_KIND}")
     return {candidate["id"]: candidate["kind"] for candidate in candidates}
 
 
@@ -503,8 +514,9 @@ def _run_validator(report: Path, evidence: Path) -> dict[str, str]:
             check=False,
             capture_output=True,
             text=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ManifestError(f"could not execute report validator: {error}") from error
     if result.returncode != 0:
         detail = result.stderr.strip().replace("\n", "; ")[:1_000]
@@ -557,8 +569,13 @@ def _run_reader_chunk(
         str(evidence),
     ]
     try:
-        result = subprocess.run(command, check=False, capture_output=True)
-    except OSError as error:
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ManifestError(f"could not execute evidence reader for {item_id}: {error}") from error
     stderr = result.stderr.decode("utf-8", errors="replace").strip()
     if result.returncode != 0:

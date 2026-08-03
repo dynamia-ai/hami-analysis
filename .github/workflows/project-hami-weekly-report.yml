@@ -21,6 +21,8 @@ jobs:
         working-directory: project-hami-weekly-report
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
       - run: uv python install 3.14
       - run: uv sync --locked

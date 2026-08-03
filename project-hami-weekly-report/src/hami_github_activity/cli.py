@@ -14,9 +14,9 @@ from pydantic import ValidationError
 from hami_github_activity.collector import ActivityCollector
 from hami_github_activity.config import AppConfig, load_config, output_path
 from hami_github_activity.date_range import ScanPeriod, build_scan_period
-from hami_github_activity.github_client import GitHubClient
+from hami_github_activity.github_client import GitHubClient, GitHubRequestError, PaginatedResult
 from hami_github_activity.markdown_renderer import render_markdown, write_markdown
-from hami_github_activity.models import CollectionWarning
+from hami_github_activity.models import CollectionResult, CollectionWarning
 from hami_github_activity.provenance import capture_worktree_snapshot
 
 
@@ -118,7 +118,7 @@ def _summary(
 
 
 def _record_repository_visibility(
-    result: object,
+    result: CollectionResult,
     *,
     expected: list[str],
     repositories: list[dict[str, object]],
@@ -134,8 +134,8 @@ def _record_repository_visibility(
             visible.append(name)
         else:
             malformed += 1
-    result.visible_repositories = sorted(set(visible))  # type: ignore[attr-defined]
-    result.expected_repositories = expected  # type: ignore[attr-defined]
+    result.visible_repositories = sorted(set(visible))
+    result.expected_repositories = expected
     problems: list[str] = []
     if inventory_incomplete:
         problems.append("repository inventory pagination was incomplete")
@@ -156,9 +156,9 @@ def _record_repository_visibility(
         if unexpected:
             problems.append("repository inventory has unlisted repositories: " + ", ".join(unexpected))
     if problems:
-        result.collection_status = "partial"  # type: ignore[attr-defined]
-        result.partial_reasons = sorted(set(result.partial_reasons + problems))  # type: ignore[attr-defined]
-        result.warnings.extend(  # type: ignore[attr-defined]
+        result.collection_status = "partial"
+        result.partial_reasons = sorted(set(result.partial_reasons + problems))
+        result.warnings.extend(
             CollectionWarning(scope="repository_inventory", message=problem) for problem in problems
         )
 
@@ -222,7 +222,16 @@ def collect(
             max_connections=workers,
             requests_per_second=requests_per_second,
         ) as client:
-            inventory = client.list_org_repositories(loaded.github.org)
+            try:
+                inventory = client.list_org_repositories(loaded.github.org)
+            except GitHubRequestError as exc:
+                inventory = PaginatedResult(
+                    items=[],
+                    incomplete=True,
+                    failed_page=1,
+                    partial_error=str(exc),
+                    partial_error_url=exc.url,
+                )
             result = ActivityCollector(client, period, workers=workers).collect(loaded.github.org)
         result.collector_started_worktree = started_worktree
         _record_repository_visibility(

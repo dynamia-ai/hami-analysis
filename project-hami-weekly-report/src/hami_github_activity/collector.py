@@ -7,7 +7,7 @@ from threading import Lock
 from typing import Any
 
 from hami_github_activity.date_range import ScanPeriod
-from hami_github_activity.github_client import GitHubClient, GitHubRequestError
+from hami_github_activity.github_client import GitHubClient, GitHubRequestError, parse_repository_url
 from hami_github_activity.models import (
     Activity,
     CollectionResult,
@@ -191,7 +191,7 @@ class ActivityCollector:
 
     @staticmethod
     def _activity_collection_failed(item: IssueEvidence | PullRequestEvidence) -> bool:
-        return any(gap.startswith("Could not collect ") for gap in item.data_gaps)
+        return any(gap.startswith("Could not collect activity ") for gap in item.data_gaps)
 
     @staticmethod
     def _candidate_id(candidate: dict[str, Any]) -> str:
@@ -227,14 +227,7 @@ class ActivityCollector:
         url = candidate.get("repository_url")
         if not isinstance(url, str):
             return None
-        marker = "/repos/"
-        if marker not in url:
-            return None
-        repository = url.split(marker, 1)[1].rstrip("/")
-        owner, separator, name = repository.partition("/")
-        if not separator or not owner or not name or "/" in name or "?" in name or "#" in name:
-            return None
-        return f"{owner}/{name}"
+        return parse_repository_url(url)
 
     def _collect_issue(self, candidate: dict[str, Any]) -> IssueEvidence | None:
         repository = self._repository_name(candidate)
@@ -399,7 +392,7 @@ class ActivityCollector:
         try:
             commit = self.client.get_json(path)
         except GitHubRequestError as exc:
-            message = f"Could not collect head commit metadata: {exc}"
+            message = f"Could not collect provenance head commit metadata: {exc}"
             data_gaps.append(message)
             self._warn(f"pull_request:{repository}#{number}", message, exc.url)
             self._mark_partial(f"pull_request:{repository}#{number}: head commit request failed")
@@ -440,30 +433,26 @@ class ActivityCollector:
             return []
         logger.info("Collecting %s data for %s", kind, scope)
         try:
-            paginated = getattr(self.client, "get_paginated_result", None)
-            if callable(paginated):
-                page_result = paginated(path, params=params) if params else paginated(path)
-                raw = page_result.items
-                if page_result.incomplete:
-                    message = (
-                        f"Could not collect page {page_result.failed_page} of {kind} data: "
-                        f"{page_result.partial_error}"
-                    )
-                    data_gaps.append(message)
-                    self._warn(scope, message, page_result.partial_error_url)
-                    self._mark_partial(f"{scope}: {kind} pagination incomplete")
-                if page_result.malformed_item_count:
-                    message = (
-                        f"Could not collect {page_result.malformed_item_count} non-object "
-                        f"{kind} record(s) returned by GitHub."
-                    )
-                    data_gaps.append(message)
-                    self._warn(scope, message)
-                    self._mark_partial(f"{scope}: {kind} pagination malformed response items")
-            else:
-                raw = self.client.get_paginated(path, params=params) if params else self.client.get_paginated(path)
+            page_result = self.client.get_paginated_result(path, params=params) if params else self.client.get_paginated_result(path)
+            raw = page_result.items
+            if page_result.incomplete:
+                message = (
+                    f"Could not collect page {page_result.failed_page} of {kind} data: "
+                    f"{page_result.partial_error}"
+                )
+                data_gaps.append(message)
+                self._warn(scope, message, page_result.partial_error_url)
+                self._mark_partial(f"{scope}: {kind} pagination incomplete")
+            if page_result.malformed_item_count:
+                message = (
+                    f"Could not collect {page_result.malformed_item_count} non-object "
+                    f"{kind} record(s) returned by GitHub."
+                )
+                data_gaps.append(message)
+                self._warn(scope, message)
+                self._mark_partial(f"{scope}: {kind} pagination malformed response items")
         except GitHubRequestError as exc:
-            message = f"Could not collect {kind} data: {exc}"
+            message = f"Could not collect activity {kind} data: {exc}"
             data_gaps.append(message)
             self._warn(scope, message, exc.url)
             self._mark_partial(f"{scope}: {kind} request failed")

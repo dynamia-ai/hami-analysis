@@ -23,6 +23,7 @@ COUNT_PATTERNS = {
     ),
     "bot_count": re.compile(r"^- Bot (?:comment )?activity: `(?P<count>\d+)`$", re.MULTILINE),
 }
+READER_TIMEOUT_SECONDS = 60.0
 
 
 def _reader_script() -> Path:
@@ -34,25 +35,29 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
 
 
 def _run_chunk(evidence: Path, kind: str, item_id: str, chunk: int) -> tuple[str, str]:
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(_reader_script()),
-            "item",
-            kind,
-            item_id,
-            "--view",
-            "triage",
-            "--chunk",
-            str(chunk),
-            "--max-bytes",
-            "20000",
-            str(evidence),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(_reader_script()),
+                "item",
+                kind,
+                item_id,
+                "--view",
+                "triage",
+                "--chunk",
+                str(chunk),
+                "--max-bytes",
+                "20000",
+                str(evidence),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=READER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"reader timed out for {item_id} chunk {chunk}") from error
     if result.returncode != 0:
         raise RuntimeError(f"reader failed for {item_id} chunk {chunk}: {result.stderr.strip()}")
     return result.stdout, result.stderr

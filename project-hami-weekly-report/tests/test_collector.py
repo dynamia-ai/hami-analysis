@@ -97,6 +97,9 @@ class FakeClient:
             raise value
         return value
 
+    def get_paginated_result(self, path: str, **kwargs: Any) -> PaginatedResult:
+        return PaginatedResult(items=self.get_paginated(path, **kwargs))
+
 
 def test_issue_classification_and_activity_counts() -> None:
     client = FakeClient([candidate(1)], [])
@@ -197,7 +200,7 @@ def test_single_endpoint_failure_is_warning_and_collection_continues() -> None:
     assert [item.number for item in result.issues] == [6, 7]
     assert result.failed_requests == 1
     assert len(result.warnings) == 1
-    assert "Could not collect comment data" in result.issues[0].data_gaps[0]
+    assert "Could not collect activity comment data" in result.issues[0].data_gaps[0]
 
 
 def test_empty_results_and_outside_period_item() -> None:

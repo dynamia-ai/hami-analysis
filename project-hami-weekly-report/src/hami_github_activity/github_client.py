@@ -11,6 +11,20 @@ import httpx
 
 
 logger = logging.getLogger(__name__)
+MAX_PAGINATED_PAGES = 100
+
+
+def parse_repository_url(repository_url: object) -> str | None:
+    if not isinstance(repository_url, str):
+        return None
+    marker = "/repos/"
+    if marker not in repository_url:
+        return None
+    repository = repository_url.split(marker, 1)[1].rstrip("/")
+    owner, separator, name = repository.partition("/")
+    if not separator or not owner or not name or "/" in name or "?" in name or "#" in name:
+        return None
+    return f"{owner}/{name}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,11 +130,11 @@ class GitHubClient:
             self.failed_requests += 1
 
     def _record_rate_limit(self, headers: httpx.Headers) -> None:
-        value = headers.get("x-ratelimit-remaining")
-        if value is None:
+        remaining_value = headers.get("x-ratelimit-remaining")
+        if remaining_value is None:
             return
         try:
-            remaining = int(value)
+            remaining = int(remaining_value)
         except ValueError:
             return
         resource = headers.get("x-ratelimit-resource", "core")
@@ -133,7 +147,7 @@ class GitHubClient:
             self.rate_limits[resource] = (remaining, reset)
             # Keep the historical scalar for evidence consumers, but never use it
             # for retry decisions: Search and core are independent quotas.
-            self.rate_limit_remaining = min(value[0] for value in self.rate_limits.values())
+            self.rate_limit_remaining = min(limit[0] for limit in self.rate_limits.values())
 
     def _rate_limit_exhausted(self, resource: str | None = None) -> bool:
         with self._state_lock:
@@ -309,6 +323,15 @@ class GitHubClient:
             # (including empty) page confirms the end of the collection.
             if not has_next and len(data) < 100:
                 break
+            if page >= MAX_PAGINATED_PAGES:
+                return PaginatedResult(
+                    items=collected,
+                    incomplete=True,
+                    failed_page=page + 1,
+                    partial_error=f"pagination exceeded the {MAX_PAGINATED_PAGES}-page safety limit",
+                    partial_error_url=str(response.request.url),
+                    malformed_item_count=malformed_item_count,
+                )
             page += 1
         return PaginatedResult(items=collected, malformed_item_count=malformed_item_count)
 
@@ -433,13 +456,7 @@ class GitHubClient:
     def _search_item_identity(item: dict[str, Any]) -> tuple[str, int] | None:
         repository_url = item.get("repository_url")
         number = item.get("number")
-        if not isinstance(repository_url, str) or not isinstance(number, int) or isinstance(number, bool) or number < 1:
-            return None
-        marker = "/repos/"
-        if marker not in repository_url:
-            return None
-        repository = repository_url.split(marker, 1)[1].rstrip("/")
-        owner, separator, name = repository.partition("/")
-        if not separator or not owner or not name or "/" in name or "?" in name or "#" in name:
+        repository = parse_repository_url(repository_url)
+        if repository is None or not isinstance(number, int) or isinstance(number, bool) or number < 1:
             return None
         return repository, number

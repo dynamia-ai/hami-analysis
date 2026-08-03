@@ -65,6 +65,27 @@ def test_pagination_probes_after_a_full_page_without_a_next_link() -> None:
     assert calls == [1, 2]
 
 
+def test_pagination_has_a_safety_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        calls.append(page)
+        return httpx.Response(
+            200,
+            json=[{"id": page}],
+            headers={"Link": '<https://api.github.com/items?page=next>; rel="next"'},
+        )
+
+    monkeypatch.setattr("hami_github_activity.github_client.MAX_PAGINATED_PAGES", 2)
+    raw = httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler))
+    result = GitHubClient("token", client=raw).get_paginated_result("/items")
+
+    assert result.incomplete is True
+    assert result.failed_page == 3
+    assert calls == [1, 2]
+
+
 def test_paginated_result_preserves_successful_pages_after_later_failure() -> None:
     calls = Counter()
 
@@ -190,7 +211,7 @@ def test_rate_limit_retry_defers_shared_request_schedule(monkeypatch: pytest.Mon
     monkeypatch.setattr("hami_github_activity.github_client.time.monotonic", lambda: 100.0)
     client = GitHubClient("token", client=raw, max_attempts=2, sleep=sleeps.append)
     assert client.get_json("/status") == {"ok": True}
-    assert sleeps == [2.0]
+    assert sleeps == [pytest.approx(2.0)]
 
 
 def test_retries_rate_limited_403() -> None:

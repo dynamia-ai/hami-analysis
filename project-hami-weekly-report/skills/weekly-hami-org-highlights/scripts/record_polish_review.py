@@ -30,6 +30,9 @@ def _skill_name(path: Path) -> str | None:
 
 
 def record_review(input_report: Path, report: Path, style_skill: Path, output: Path) -> None:
+    input_report = input_report.resolve()
+    report = report.resolve()
+    style_skill = style_skill.resolve()
     if _skill_name(style_skill) != STYLE_SKILL_NAME:
         raise ValueError(f"style skill must declare name: {STYLE_SKILL_NAME}")
     review = {
