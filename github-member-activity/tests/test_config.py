@@ -1,4 +1,6 @@
 from datetime import date
+from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -37,3 +39,29 @@ def test_config_accepts_padded_github_node_ids():
     value = config()
     value["members"][0]["github_node_id"] = "MDQ6VXNlcjMzMjgxODU="
     assert AppConfig.model_validate(value).members[0].github_node_id.endswith("=")
+
+
+@pytest.mark.parametrize("directory", ["output", "./reports", "reports", "../output", "/tmp/output"])
+def test_config_rejects_output_directories_that_are_not_ignored(directory: str):
+    value = config()
+    value["output"]["directory"] = directory
+    with pytest.raises(ValueError, match="output.directory"):
+        AppConfig.model_validate(value)
+
+
+def test_runtime_config_and_artifacts_are_git_ignored():
+    repository = Path(__file__).resolve().parents[2]
+    for path in (
+        "github-member-activity/config.yaml",
+        "github-member-activity/output/event-ledger.jsonl",
+        "github-member-activity/output/report.md",
+        "github-member-activity/output/run-manifest.json",
+        "github-member-activity/diagnostics/run-manifest.json",
+    ):
+        result = subprocess.run(
+            ["git", "-C", str(repository), "check-ignore", "-q", "--", path],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr

@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 import github_member_activity.cli as cli_module
+import github_member_activity.period as period_module
 from github_member_activity.collector import CollectionResult
 from github_member_activity.cli import _validate_receipt_path, _write_receipt, app
 from github_member_activity.canonical import canonical_json
@@ -19,6 +20,20 @@ from github_member_activity.period import ReportPeriod, build_period
 
 RUNNER = CliRunner()
 EXAMPLE_CONFIG = Path(__file__).parents[1] / "config.example.yaml"
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(monkeypatch):
+    """Keep period/stability assertions independent of the day the suite runs."""
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 1, tzinfo=UTC)
+            return value.astimezone(tz) if tz is not None else value.replace(tzinfo=None)
+
+    monkeypatch.setattr(cli_module, "datetime", FixedDateTime)
+    monkeypatch.setattr(period_module, "datetime", FixedDateTime)
 
 
 def test_cli_help_documents_stable_exit_codes():

@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 from datetime import date
-from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -122,9 +121,8 @@ class OutputConfig(BaseModel):
     @field_validator("directory")
     @classmethod
     def safe_directory(cls, value: str) -> str:
-        path = Path(value)
-        if not value or any(ord(char) < 0x20 or ord(char) == 0x7f for char in value) or any(not re.fullmatch(r"[A-Za-z0-9._-]+", part) for part in path.parts if part not in {".", ".."}) or path.is_absolute() or ".." in path.parts or value.startswith("~"):
-            raise ValueError("output.directory must be a safe relative path")
+        if value != "./output":
+            raise ValueError("output.directory must be ./output so runtime artifacts remain untracked")
         return value
 
 
