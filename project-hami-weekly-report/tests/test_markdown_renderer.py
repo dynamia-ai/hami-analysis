@@ -57,6 +57,17 @@ def test_scalar_escapes_markdown_emphasis_characters() -> None:
     assert _text_scalar("asterisk * and underscore _") == "asterisk &#42; and underscore &#95;"
 
 
+def test_index_labels_and_plain_urls_are_encoded_once_in_text_context() -> None:
+    item = issue(title="Scheduler")
+    item.labels = ["needs_triage"]
+    item.url = "https://example.test/*emphasis*"
+    content = render_markdown(org="Project-HAMi", period=PERIOD, result=CollectionResult(issues=[item]))
+
+    assert "needs&#95;triage" in content
+    assert "needs&amp;#95;triage" not in content
+    assert "- URL: https://example.test/&#42;emphasis&#42;" in content
+
+
 def issue(body: str = "body", title: str = "A | title") -> IssueEvidence:
     return IssueEvidence(
         repository="Project-HAMi/HAMi",

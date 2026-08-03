@@ -144,7 +144,7 @@ def _issue_index(issue: IssueEvidence) -> str:
             _yes(issue.closed_in_period),
             str(issue.period_human_activity_count),
             _table(issue.author_association or "NONE"),
-            _table(_list(issue.labels)),
+            _list(issue.labels),
             f"[evidence](#{_anchor('issue', issue.item_id)})",
         ]
     )
@@ -164,7 +164,7 @@ def _pr_index(pr: PullRequestEvidence) -> str:
             _yes(pr.merged_in_period),
             str(pr.period_human_activity_count),
             _table(pr.author_association or "NONE"),
-            _table(_list(pr.labels)),
+            _list(pr.labels),
             f"[evidence](#{_anchor('pull-request', pr.item_id)})",
         ]
     )
@@ -190,7 +190,7 @@ def _issue_block(issue: IssueEvidence) -> str:
 #### Metadata
 
 - Title: {_text_scalar(issue.title)}
-- URL: {_scalar(issue.url)}
+- URL: {_text_scalar(issue.url)}
 - State: `{_scalar(issue.state)}`
 - State reason: `{_scalar(issue.state_reason)}`
 - Author: `{_scalar(issue.author)}`
@@ -286,7 +286,7 @@ def _pr_block(pr: PullRequestEvidence) -> str:
 #### Metadata
 
 - Title: {_text_scalar(pr.title)}
-- URL: {_scalar(pr.url)}
+- URL: {_text_scalar(pr.url)}
 - State: `{_scalar(pr.state)}`
 - Draft: `{_yes(pr.draft)}`
 - Merged: `{_yes(pr.merged)}`
