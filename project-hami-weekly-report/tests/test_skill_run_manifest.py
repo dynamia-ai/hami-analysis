@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -335,6 +336,34 @@ def test_run_manifest_records_hashes_and_requires_report_selection(tmp_path: Pat
     assert manifest["collector_started_worktree"]["head"] == "a" * 40
     assert manifest["collector_started_worktree"]["dirty"] is False
     assert "worktree_snapshot_sha256" in manifest["skill_worktree"]
+
+
+def test_run_manifest_handles_non_utf8_untracked_filename(tmp_path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    for key, value in (
+        ("user.email", "manifest@example.test"),
+        ("user.name", "Manifest Test"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", ""),
+        ("core.quotePath", "false"),
+    ):
+        subprocess.run(["git", "config", key, value], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
+    raw_name = b"non-utf8-\xff.txt"
+    non_utf8 = tmp_path / os.fsdecode(raw_name)
+    non_utf8.write_bytes(b"untracked")
+
+    result = _run(
+        tmp_path,
+        "".join(json.dumps(_record(item_id)) + "\n" for item_id in ("Project-HAMi/HAMi#1", "Project-HAMi/HAMi#2", "Project-HAMi/HAMi#4")),
+    )
+
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    entries = manifest["collector_worktree"]["untracked"]
+    assert any(os.fsencode(entry["path"]) == raw_name for entry in entries)
 
 
 def test_run_manifest_rejects_missing_selected_report_item(tmp_path: Path) -> None:

@@ -318,7 +318,7 @@ def _git_provenance(directory: Path) -> dict[str, object] | None:
         return None
     root_path = Path(root)
     head = _git_output(root_path, "rev-parse", "HEAD")
-    status = _git_text(root_path, "status", "--porcelain=v1")
+    status = _git_bytes(root_path, "status", "--porcelain=v1")
     tracked_diff = _git_bytes(root_path, "diff", "--binary", "HEAD")
     untracked = _git_bytes(root_path, "ls-files", "--others", "--exclude-standard", "-z")
     if head is None or status is None or tracked_diff is None or untracked is None:
@@ -744,7 +744,7 @@ def write_manifest(
         "triage_replay": triage_replay,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output.write_text(json.dumps(manifest, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 
 
 def _parser() -> argparse.ArgumentParser:
