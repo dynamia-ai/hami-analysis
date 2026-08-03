@@ -59,6 +59,21 @@ class Activity:
         return is_maintainer(self.author_association)
 
     @property
+    def actor_type(self) -> Literal["bot", "maintainer", "human"]:
+        """Classify the source of an activity for report provenance.
+
+        A maintainer is still a human, but it is useful to keep the stronger
+        repository-role signal distinct from ordinary human activity.  Bot output
+        must never be promoted to a verified engineering fact without another
+        source of confirmation.
+        """
+        if self.bot:
+            return "bot"
+        if self.maintainer:
+            return "maintainer"
+        return "human"
+
+    @property
     def active_in_period(self) -> bool:
         return self.in_period or self.updated_in_period
 
@@ -133,6 +148,10 @@ class PullRequestEvidence:
     closed_unmerged_in_period: bool
     exact_activity_unknown: bool
     data_gaps: list[str] = field(default_factory=list)
+    head_sha: str | None = None
+    head_commit_at: datetime | None = None
+    review_decision: str | None = None
+    unresolved_review_thread_count: int | None = None
 
     @property
     def item_id(self) -> str:
@@ -163,3 +182,8 @@ class CollectionResult:
     rate_limit_remaining: int | None = None
     unexplained_updated_excluded_count: int = 0
     activity_failure_excluded_count: int = 0
+    collection_status: Literal["complete", "partial"] = "complete"
+    partial_reasons: list[str] = field(default_factory=list)
+    collector_started_worktree: dict[str, object] | None = None
+    expected_repositories: list[str] = field(default_factory=list)
+    visible_repositories: list[str] = field(default_factory=list)

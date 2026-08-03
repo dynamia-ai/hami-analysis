@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from string import Formatter
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from hami_github_activity.date_range import UTC_PLUS_EIGHT_TIMEZONE
 
@@ -13,6 +13,24 @@ class GithubConfig(BaseModel):
 
     org: str = Field(min_length=1)
     token_env: str = Field(min_length=1)
+    expected_repositories: list[str] = Field(min_length=1)
+
+    @field_validator("expected_repositories")
+    @classmethod
+    def valid_expected_repositories(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        normalized = [name.strip() for name in value]
+        org = info.data.get("org")
+        if any(
+            not name
+            or name.count("/") != 1
+            or any(not part or any(character.isspace() for character in part) for part in name.split("/"))
+            or (isinstance(org, str) and name.split("/", 1)[0] != org)
+            for name in normalized
+        ):
+            raise ValueError("expected_repositories entries must use OWNER/REPOSITORY form")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("expected_repositories entries must be unique")
+        return sorted(normalized)
 
 
 class ScanConfig(BaseModel):
@@ -67,4 +85,20 @@ def output_path(config_path: Path, template: str, *, org: str, start_date: str, 
     except (KeyError, IndexError, ValueError) as exc:
         raise ValueError(f"invalid output filename template: {exc}") from exc
     path = Path(rendered).expanduser()
-    return path if path.is_absolute() else config_path.resolve().parent / path
+    if path.is_absolute():
+        raise ValueError("output file must be a relative path under output/")
+
+    config_root = config_path.resolve().parent
+    output_root = config_root / "output"
+    if output_root.is_symlink():
+        raise ValueError("output directory must not be a symbolic link")
+    if output_root.exists() and not output_root.is_dir():
+        raise ValueError("output path must be a directory")
+    resolved = (config_root / path).resolve()
+    try:
+        resolved.relative_to(output_root)
+    except ValueError as exc:
+        raise ValueError("output file must be under the config directory's output/") from exc
+    if resolved == output_root:
+        raise ValueError("output file must be a file below the output directory")
+    return resolved

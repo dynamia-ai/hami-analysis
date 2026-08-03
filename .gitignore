@@ -210,3 +210,13 @@ cython_debug/
 output/
 .worktrees/
 .worktree/
+
+# Project-HAMi weekly-report runtime data. Keep only config.example.yaml and
+# checked-in documentation/templates in this repository; inject real config
+# and retain generated evidence/reports/artifacts outside Git.
+project-hami-weekly-report/config*.yaml
+!project-hami-weekly-report/config.example.yaml
+project-hami-weekly-report/evidence/
+project-hami-weekly-report/artifacts/
+project-hami-weekly-report/diagnostics/
+project-hami-weekly-report/output/

@@ -23,7 +23,7 @@ def test_timezone_conversion_to_utc() -> None:
     )
     assert period.utc_start.isoformat() == "2026-07-09T16:00:00+00:00"
     assert period.utc_end.isoformat() == "2026-07-16T14:30:00+00:00"
-    assert period.search_start_date == "2026-07-10"
+    assert period.search_start_date == "2026-07-09"
     assert period.search_end_date == "2026-07-16"
 
 

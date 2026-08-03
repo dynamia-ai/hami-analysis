@@ -4,9 +4,11 @@ from threading import Lock
 from time import sleep
 from typing import Any
 
+import pytest
+
 from hami_github_activity.collector import ActivityCollector
 from hami_github_activity.date_range import build_scan_period
-from hami_github_activity.github_client import GitHubRequestError, SearchResult
+from hami_github_activity.github_client import GitHubRequestError, PaginatedResult, SearchResult
 
 
 PERIOD = build_scan_period(
@@ -96,6 +98,9 @@ class FakeClient:
             self.failed_requests += 1
             raise value
         return value
+
+    def get_paginated_result(self, path: str, **kwargs: Any) -> PaginatedResult:
+        return PaginatedResult(items=self.get_paginated(path, **kwargs))
 
 
 def test_issue_classification_and_activity_counts() -> None:
@@ -197,7 +202,7 @@ def test_single_endpoint_failure_is_warning_and_collection_continues() -> None:
     assert [item.number for item in result.issues] == [6, 7]
     assert result.failed_requests == 1
     assert len(result.warnings) == 1
-    assert "Could not collect comment data" in result.issues[0].data_gaps[0]
+    assert "Could not collect activity comment data" in result.issues[0].data_gaps[0]
 
 
 def test_empty_results_and_outside_period_item() -> None:
@@ -256,6 +261,56 @@ def test_activity_endpoint_failure_has_separate_exclusion_count() -> None:
     assert result.warnings[0].scope == "issue:Project-HAMi/HAMi#19"
 
 
+@pytest.mark.parametrize(
+    "page_result",
+    [
+        PaginatedResult(items=[], incomplete=True, failed_page=2, partial_error="later page failed"),
+        PaginatedResult(items=[], malformed_item_count=1),
+    ],
+)
+def test_activity_page_failures_are_not_unexplained_updated_exclusions(
+    page_result: PaginatedResult,
+) -> None:
+    class ActivityFailureClient(FakeClient):
+        def get_paginated_result(self, path: str, **_: Any) -> PaginatedResult:
+            assert path.endswith("/comments")
+            return page_result
+
+    client = ActivityFailureClient([candidate(21)], [])
+    client.details["/repos/Project-HAMi/HAMi/issues/21"] = issue_detail(
+        21,
+        created_at="2026-06-01T00:00:00Z",
+        updated_at="2026-07-12T00:00:00Z",
+    )
+    result = ActivityCollector(client, PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    assert result.issues == []
+    assert result.activity_failure_excluded_count == 1
+    assert result.unexplained_updated_excluded_count == 0
+
+
+def test_head_commit_failure_remains_distinct_from_activity_failure() -> None:
+    class HeadFailureClient(FakeClient):
+        def get_json(self, path: str, **kwargs: Any) -> dict[str, Any]:
+            if path.endswith("/commits/abc123"):
+                raise GitHubRequestError("commit unavailable", url=path)
+            return super().get_json(path, **kwargs)
+
+    client = HeadFailureClient([], [candidate(22)])
+    client.details["/repos/Project-HAMi/HAMi/pulls/22"] = pr_detail(
+        22,
+        created_at="2026-06-01T00:00:00Z",
+        updated_at="2026-07-12T00:00:00Z",
+        head={"ref": "fix", "sha": "abc123"},
+    )
+    collector = ActivityCollector(client, PERIOD)
+    item = collector._collect_pull_request(client.pr_candidates[0])
+
+    assert item is not None
+    assert any(gap.startswith("Could not collect provenance head commit metadata") for gap in item.data_gaps)
+    assert not collector._activity_collection_failed(item)
+
+
 def test_collection_logs_search_and_item_progress(caplog: object) -> None:
     client = FakeClient([candidate(10)], [])
     client.details["/repos/Project-HAMi/HAMi/issues/10"] = issue_detail(10)
@@ -264,7 +319,7 @@ def test_collection_logs_search_and_item_progress(caplog: object) -> None:
     messages = [record.getMessage() for record in caplog.records]  # type: ignore[attr-defined]
     assert (
         "Searching GitHub for issue candidates: "
-        "org:Project-HAMi is:issue updated:2026-07-10..2026-07-16"
+        "org:Project-HAMi is:issue updated:>=2026-07-09"
     ) in messages
     assert "Found 1 issue candidates" in messages
     assert "Collecting issue 1/1: Project-HAMi/HAMi#10" in messages
@@ -321,6 +376,33 @@ def test_existing_review_comment_updated_in_period_is_retained_as_activity() -> 
     assert result.pull_requests[0].period_human_activity_count == 1
 
 
+def test_pull_request_captures_head_commit_metadata_and_review_state() -> None:
+    client = FakeClient([], [candidate(20)])
+    client.details["/repos/Project-HAMi/HAMi/pulls/20"] = pr_detail(
+        20,
+        head={"ref": "fix", "sha": "abc123"},
+    )
+    client.details["/repos/Project-HAMi/HAMi/commits/abc123"] = {
+        "commit": {"author": {"date": "2026-07-14T12:00:00Z"}}
+    }
+    client.lists["/repos/Project-HAMi/HAMi/pulls/20/reviews"] = [
+        {
+            "user": {"login": "maintainer", "type": "User"},
+            "author_association": "MEMBER",
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-07-14T13:00:00Z",
+            "body": "please revise",
+        }
+    ]
+
+    result = ActivityCollector(client, PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    pr = result.pull_requests[0]
+    assert pr.head_sha == "abc123"
+    assert pr.head_commit_at == datetime(2026, 7, 14, 12, tzinfo=UTC)
+    assert pr.review_decision == "maintainer:CHANGES_REQUESTED"
+
+
 def test_candidates_are_processed_with_bounded_parallelism() -> None:
     class ConcurrentClient(FakeClient):
         def __init__(self) -> None:
@@ -363,3 +445,104 @@ def test_issue_search_payload_avoids_redundant_detail_and_empty_comments_request
     assert [item.number for item in result.issues] == [15]
     assert client.failed_requests == 0
     assert client.list_calls == []
+
+
+def test_search_failure_fails_closed_instead_of_returning_empty_evidence() -> None:
+    class SearchFailureClient(FakeClient):
+        def search_issues(self, query: str) -> SearchResult:
+            raise GitHubRequestError("bad credentials", url="https://api.github.test/search")
+
+    client = SearchFailureClient([], [])
+    try:
+        ActivityCollector(client, PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+    except GitHubRequestError as error:
+        assert "bad credentials" in str(error)
+    else:
+        raise AssertionError("a failed Search request must fail collection")
+
+
+def test_incomplete_search_marks_evidence_partial() -> None:
+    class PartialSearchClient(FakeClient):
+        def search_issues(self, query: str) -> SearchResult:
+            return SearchResult(items=[], total_count=1, capped=False, incomplete=True)
+
+    result = ActivityCollector(PartialSearchClient([], []), PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+    assert result.collection_status == "partial"
+    assert result.partial_reasons == [
+        "search:issue: incomplete results",
+        "search:pr: incomplete results",
+    ]
+
+
+def test_malformed_search_candidate_marks_collection_partial_instead_of_silently_dropping_it() -> None:
+    class MalformedSearchClient(FakeClient):
+        def search_issues(self, query: str) -> SearchResult:
+            return SearchResult(items=[{}], total_count=1, capped=False)
+
+    result = ActivityCollector(MalformedSearchClient([], []), PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    assert result.collection_status == "partial"
+    assert result.issues == []
+    assert result.pull_requests == []
+    assert result.partial_reasons == [
+        "search:issue: malformed candidate",
+        "search:pr: malformed candidate",
+    ]
+    assert len(result.warnings) == 2
+    assert all("malformed candidate" in warning.message for warning in result.warnings)
+
+
+def test_non_object_search_items_mark_collection_partial() -> None:
+    class NonObjectSearchClient(FakeClient):
+        def search_issues(self, query: str) -> SearchResult:
+            return SearchResult(items=[], total_count=1, capped=False, malformed_item_count=1)
+
+    result = ActivityCollector(NonObjectSearchClient([], []), PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    assert result.collection_status == "partial"
+    assert result.partial_reasons == [
+        "search:issue: malformed response items",
+        "search:pr: malformed response items",
+    ]
+    assert len(result.warnings) == 2
+    assert all("non-object candidate" in warning.message for warning in result.warnings)
+
+
+def test_invalid_or_duplicate_search_identities_mark_collection_partial() -> None:
+    class InvalidIdentitySearchClient(FakeClient):
+        def search_issues(self, query: str) -> SearchResult:
+            return SearchResult(
+                items=[],
+                total_count=2,
+                capped=False,
+                malformed_identity_count=1,
+                duplicate_item_count=1,
+                incomplete=True,
+            )
+
+    result = ActivityCollector(InvalidIdentitySearchClient([], []), PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    assert result.collection_status == "partial"
+    assert result.partial_reasons == [
+        "search:issue: incomplete results",
+        "search:issue: malformed candidate identity",
+        "search:pr: incomplete results",
+        "search:pr: malformed candidate identity",
+    ]
+
+
+def test_non_object_activity_page_entries_mark_collection_partial() -> None:
+    class NonObjectActivityPageClient(FakeClient):
+        def get_paginated_result(self, path: str, **_: Any) -> PaginatedResult:
+            assert path.endswith("/comments")
+            return PaginatedResult(items=[], malformed_item_count=1)
+
+    client = NonObjectActivityPageClient([candidate(1)], [])
+    client.details["/repos/Project-HAMi/HAMi/issues/1"] = issue_detail(1, comments=1)
+
+    result = ActivityCollector(client, PERIOD).collect("Project-HAMi")  # type: ignore[arg-type]
+
+    assert result.collection_status == "partial"
+    assert result.partial_reasons == [
+        "issue:Project-HAMi/HAMi#1: comment pagination malformed response items"
+    ]
