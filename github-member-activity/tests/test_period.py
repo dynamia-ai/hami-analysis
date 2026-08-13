@@ -1,9 +1,9 @@
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from github_member_activity.period import _local_midnight, build_period, effective_window, parse_rfc3339
-from zoneinfo import ZoneInfo
 
 
 def test_previous_week_is_half_open():
@@ -36,3 +36,8 @@ def test_nonexistent_local_midnight_is_rejected():
 def test_ambiguous_local_midnight_is_rejected():
     with pytest.raises(ValueError):
         _local_midnight(__import__("datetime").date(1991, 10, 13), ZoneInfo("America/Havana"))
+
+
+def test_relative_period_rejects_naive_now():
+    with pytest.raises(ValueError, match="now must carry an offset"):
+        build_period("weekly", "Asia/Shanghai", now=datetime(2026, 8, 1, 12, tzinfo=UTC).replace(tzinfo=None))

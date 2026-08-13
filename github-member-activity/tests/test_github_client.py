@@ -6,8 +6,10 @@ from github_member_activity.github_client import GitHubClient, GitHubRequestErro
 class TwoPageClient(GitHubClient):
     def __init__(self, pages):
         self.pages = iter(pages)
+        self.calls = 0
 
     def graphql(self, query, variables):
+        self.calls += 1
         return next(self.pages)
 
 
@@ -24,6 +26,18 @@ def test_graphql_duplicate_stable_node_fails():
     client = TwoPageClient([page("c1", {"id": "n1"}, True, "c1"), page("c2", {"id": "n1"}, False, "c2")])
     with pytest.raises(GitHubRequestError):
         client.connection("", {}, ("root",))
+
+
+def test_graphql_total_count_overrun_fails_before_requesting_another_page():
+    pages = [
+        {"root": {"totalCount": 1, "edges": [{"cursor": "c1", "node": {"id": "n1"}}], "pageInfo": {"hasNextPage": True, "endCursor": "A"}}},
+        {"root": {"totalCount": 1, "edges": [{"cursor": "c2", "node": {"id": "n2"}}], "pageInfo": {"hasNextPage": True, "endCursor": "B"}}},
+        {"root": {"totalCount": 1, "edges": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}},
+    ]
+    client = TwoPageClient(pages)
+    with pytest.raises(GitHubRequestError, match="graphql_cardinality_mismatch"):
+        client.connection("", {}, ("root",))
+    assert client.calls == 2
 
 
 def test_graphql_cursor_cycle_fails_closed():

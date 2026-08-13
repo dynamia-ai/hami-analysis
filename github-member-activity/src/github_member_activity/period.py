@@ -97,6 +97,8 @@ def build_period(kind: str, timezone: str, *, now: datetime | None = None, start
         return ReportPeriod(kind, timezone, start_dt.astimezone(zone), end_dt.astimezone(zone))
     if kind not in {"weekly", "monthly"}:
         raise ValueError("period must be weekly, monthly, or explicit")
+    if now is not None and (now.tzinfo is None or now.utcoffset() is None):
+        raise ValueError("now must carry an offset")
     current = (now or datetime.now(zone)).astimezone(zone)
     today = current.date()
     if kind == "weekly":

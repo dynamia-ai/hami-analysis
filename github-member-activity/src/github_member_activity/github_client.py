@@ -127,6 +127,8 @@ class GitHubClient:
                     raise GitHubRequestError("graphql_cardinality_mismatch")
                 seen_nodes.add(stable_node)
                 result.append(edge["node"])
+            if len(result) > expected_total:
+                raise GitHubRequestError("graphql_cardinality_mismatch")
             info = data["pageInfo"]
             has_next = info.get("hasNextPage")
             next_cursor = info.get("endCursor")

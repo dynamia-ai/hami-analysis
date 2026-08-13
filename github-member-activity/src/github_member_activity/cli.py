@@ -178,6 +178,7 @@ def collect_command(
         statuses = [type(row)(row.member_id, row.source, row.criticality, "not_run", "stability_gap_not_met") if row.status != "not_applicable" else row for row in empty_statuses(value, report_period, observed_at=observed)]
     else:
         result = None
+        statuses = empty_statuses(value, report_period, observed_at=observed)
         phase = "collect"
         try:
             token = token_for(value)
@@ -187,10 +188,10 @@ def collect_command(
         try:
             with GitHubClient(token, api_version=value.github.api_version) as client:
                 result = collect(value, report_period, client, observed_at=observed)
-            statuses = result.statuses
+                statuses = result.statuses
+                phase = "build"
             reason = "core_source_incomplete" if any(row.criticality == "core" and row.status not in {"complete", "not_applicable"} for row in statuses) else None
             if reason is None:
-                phase = "build"
                 status_obj = source_status_object(statuses)
                 resolved = safe_resolved_config(value, result.applied_owner_ids, result.applied_repo_ids)
                 rows = [event.to_dict() for event in result.events]
@@ -229,7 +230,7 @@ def collect_command(
         except typer.Exit:
             raise
         except FileExistsError:
-            reason = "output_conflict" if phase == "artifact_write" else "artifact_write_failed"
+            reason = "output_conflict" if phase == "artifact_write" else "artifact_write_failed" if phase in {"build", "receipt"} else "run_aborted"
             if result is None:
                 statuses = empty_statuses(value, report_period, observed_at=observed)
         except OSError:

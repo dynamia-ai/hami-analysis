@@ -48,6 +48,7 @@ def test_workflow_has_frozen_static_contract():
     assert trigger["workflow_dispatch"]["inputs"]["period"]["options"] == ["weekly", "monthly"]
     steps = data["jobs"]["collect"]["steps"]
     assert steps[0]["uses"] == "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+    assert steps[0]["with"] == {"persist-credentials": False}
     assert steps[1]["uses"] == "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
     assert steps[1]["with"] == {"python-version": "3.14"}
     assert steps[2]["uses"] == "astral-sh/setup-uv@6b9c6063abd4a2e6e5c9c6d6d0c7d25f4c0b0c21"

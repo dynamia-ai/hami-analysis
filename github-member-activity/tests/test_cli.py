@@ -127,6 +127,40 @@ def test_collect_oserror_is_run_aborted_not_artifact_failure(tmp_path, monkeypat
     assert '"run_reason":"run_aborted"' in (diagnostic[0] / "run-manifest.json").read_text(encoding="utf-8")
 
 
+@pytest.mark.parametrize("failure", [OSError("client close failed"), FileExistsError("client close failed")])
+def test_client_exit_failure_preserves_result_in_artifact_failure_diagnostic(tmp_path, monkeypatch, failure):
+    config = tmp_path / "config.yaml"
+    config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setenv("PUBLIC_GITHUB_TOKEN", "test-token")
+
+    class ExitFailureClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            raise failure
+
+    sources = ("prs_opened", "issues_opened", "issue_replies", "prs_reviewed", "authored_prs_merged", "commit_context")
+    statuses = [
+        SourceStatus("example-member", source, "optional" if source == "commit_context" else "core", "complete", None, True, None if source in {"issue_replies", "prs_reviewed"} else True, True, True, "2026-08-01T00:00:00Z")
+        for source in sources
+    ]
+    monkeypatch.setattr(cli_module, "GitHubClient", ExitFailureClient)
+    monkeypatch.setattr(cli_module, "collect", lambda *args, **kwargs: CollectionResult([], statuses, [], [], "2026-08-01T00:00:00Z"))
+
+    result = RUNNER.invoke(app, ["collect", "--config", str(config), "--period", "weekly"])
+
+    assert result.exit_code == 4
+    diagnostics = list((tmp_path / "diagnostics").iterdir())
+    assert len(diagnostics) == 1
+    manifest = json.loads((diagnostics[0] / "run-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_reason"] == "artifact_write_failed"
+    assert manifest["diagnostic_source_status"]["rows"] == [row.to_dict() for row in statuses]
+
+
 def test_build_oserror_is_artifact_write_failure_and_writes_diagnostic(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     config.write_text(EXAMPLE_CONFIG.read_text(encoding="utf-8"), encoding="utf-8")

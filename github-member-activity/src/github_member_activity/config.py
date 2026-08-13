@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import date
+from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -10,6 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .canonical import sha256_json
+from .models import SCHEMA_VERSION
 
 TOKEN_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 MEMBER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -130,7 +132,7 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     github: GithubConfig
     period: PeriodConfig
-    members: list[MemberConfig]
+    members: list[MemberConfig] = Field(min_length=1)
     repository_policy: RepositoryPolicyConfig
     output: OutputConfig
 
@@ -168,7 +170,7 @@ def token_for(config: AppConfig) -> str:
 
 def safe_resolved_config(config: AppConfig, applied_owner_ids: list[str] | None = None, applied_repo_ids: list[str] | None = None) -> dict:
     return {
-        "schema_version": "1.0",
+        "schema_version": SCHEMA_VERSION,
         "timezone": config.period.timezone,
         "members": [
             {

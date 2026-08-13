@@ -64,6 +64,8 @@ def _record_optional_commit_gate_failure(statuses: list[SourceStatus], member_id
 
 
 def _record_final_gate_auth_failure(statuses: list[SourceStatus]) -> None:
+    # Authentication invalidates every source claim for an effective member,
+    # including a source that was independently not applicable in this period.
     applicable_members = {row.member_id for row in statuses if row.status != "not_applicable"}
     for index, row in enumerate(statuses):
         if row.member_id in applicable_members:
@@ -173,6 +175,8 @@ def _commit_group_pages(client: GitHubClient, login: str, start_day, end_day) ->
 
 
 def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, start: datetime, end: datetime, policy) -> list[dict[str, Any]]:
+    # GitHub contribution days are server-provided date labels. Query a UTC-label
+    # candidate envelope, then enforce the effective local-date labels below.
     start_day = start.date()
     end_day = (end - timedelta(seconds=1)).date()
     if end_day < start_day:
@@ -746,8 +750,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                             eligible_reviews.append({"id": review.get("id"), "submitted": submitted})
                     if not eligible_reviews:
                         raise RuntimeError("api_contract_violation")
-                    if eligible_reviews:
-                        reps.append((pr_id, min(eligible_reviews, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
+                    reps.append((pr_id, min(eligible_reviews, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
                 digest = tuple(sorted((pr_id, str(review["id"]), review["submitted"]) for pr_id, review in reps))
                 review_snapshots.append(digest)
                 representative_rows = reps
@@ -800,6 +803,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     events.append(LedgerEvent(member.member_id, member.github_node_id, "commit_day", None, metadata.node_id, metadata.node_id, metadata.full_name, metadata.owner_node_id, metadata.owner_login.lower(), None, item["day"], item["quantity"], format_z(finished), format_z(finished), f"commit-root-{start.date().isoformat()}--{end.date().isoformat()}", f"https://github.com/{metadata.full_name}/commits?author={member.github_login}&since={item['day']}T00%3A00%3A00Z&until={next_day}T00%3A00%3A00Z"))
                 set_status(member.member_id, "commit_context", "complete", None, finished)
             except Exception as exc:
+                if _exception_reason(exc, "commit_context_unavailable") == "authentication_failed":
+                    _record_final_gate_auth_failure(statuses)
+                    break
                 set_status(member.member_id, "commit_context", "partial", "commit_context_unavailable")
     gate_at: datetime | None = None
     if events:

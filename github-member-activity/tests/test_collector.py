@@ -24,6 +24,13 @@ class EmptyGitHub:
         return []
 
 
+class CommitAuthenticationFailureGitHub(EmptyGitHub):
+    def graphql(self, query, variables):
+        if "commitContributionsByRepository" in query:
+            raise GitHubRequestError("authentication_failed")
+        return super().graphql(query, variables)
+
+
 class SearchActorMismatchGitHub:
     def graphql(self, query, variables):
         if "user(login" in query:
@@ -275,7 +282,7 @@ class MultiRepositoryCommitGitHub:
         groups = []
         for repo_id in ("R1", "R2"):
             terminal = target == repo_id
-            edge = {"cursor": f"{repo_id}-c2" if terminal else f"{repo_id}-c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": f"2026-01-02T12:00:00Z" if terminal else "2026-01-01T12:00:00Z", "commitCount": 1, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": repo_id}}}
+            edge = {"cursor": f"{repo_id}-c2" if terminal else f"{repo_id}-c1", "node": {"__typename": "CreatedCommitContribution", "isRestricted": False, "occurredAt": "2026-01-02T12:00:00Z" if terminal else "2026-01-01T12:00:00Z", "commitCount": 1, "user": {"__typename": "User", "id": "U1"}, "repository": {"id": repo_id}}}
             groups.append({"repository": {"id": repo_id, "visibility": "PUBLIC", "owner": {"id": f"O-{repo_id}"}}, "contributions": {"totalCount": 2, "edges": [edge], "pageInfo": {"hasNextPage": not terminal, "endCursor": None if terminal else f"{repo_id}-c1"}}})
         return {"user": {"contributionsCollection": {"commitContributionsByRepository": groups}}}
 
@@ -334,6 +341,14 @@ def test_empty_public_snapshot_is_complete_not_zero_guess_for_core_sources():
     period = build_period("explicit", "UTC", start="2026-01-01T00:00:00Z", end="2026-01-08T00:00:00Z")
     result = collect(config, period, EmptyGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
     assert all(row.status == "complete" for row in result.statuses if row.criticality == "core")
+    assert result.events == []
+
+
+def test_commit_authentication_failure_normalizes_all_applicable_sources():
+    config, period = _proof_fixture()
+    result = collect(config, period, CommitAuthenticationFailureGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    rows = [row for row in result.statuses if row.member_id == "alice"]
+    assert all(row.status == "failed" and row.reason == "authentication_failed" for row in rows)
     assert result.events == []
 
 
@@ -530,6 +545,7 @@ def test_final_gate_auth_failure_normalizes_all_applicable_sources():
         SourceStatus("bob", source, "optional" if source == "commit_context" else "core", "not_applicable", "member_window_empty")
         for source in sources
     ]
+    statuses[5] = SourceStatus("alice", "commit_context", "optional", "not_applicable", "commit_period_not_day_aligned")
     _record_final_gate_auth_failure(statuses)
     alice = [row for row in statuses if row.member_id == "alice"]
     bob = [row for row in statuses if row.member_id == "bob"]
