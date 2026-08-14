@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild candidate ledger measurements from the bounded triage reader."""
+"""Rebuild candidate ledger measurements from every declared bounded reader view."""
 
 from __future__ import annotations
 
@@ -24,6 +24,13 @@ COUNT_PATTERNS = {
     "bot_count": re.compile(r"^- Bot (?:comment )?activity: `(?P<count>\d+)`$", re.MULTILINE),
 }
 READER_TIMEOUT_SECONDS = 60.0
+CONTRIBUTION_GATE_FIELDS = {
+    "contribution_gate_status",
+    "contribution_gate_ids",
+    "contribution_gate_reason",
+    "contribution_gate_evidence_views",
+    "contribution_gate_evidence_urls",
+}
 
 
 def _reader_script() -> Path:
@@ -34,7 +41,9 @@ def _read_jsonl(path: Path) -> list[dict[str, object]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _run_chunk(evidence: Path, kind: str, item_id: str, chunk: int) -> tuple[str, str]:
+def _run_chunk(
+    evidence: Path, kind: str, item_id: str, view: str, chunk: int
+) -> tuple[str, str]:
     try:
         result = subprocess.run(
             [
@@ -44,7 +53,7 @@ def _run_chunk(evidence: Path, kind: str, item_id: str, chunk: int) -> tuple[str
                 kind,
                 item_id,
                 "--view",
-                "triage",
+                view,
                 "--chunk",
                 str(chunk),
                 "--max-bytes",
@@ -63,8 +72,8 @@ def _run_chunk(evidence: Path, kind: str, item_id: str, chunk: int) -> tuple[str
     return result.stdout, result.stderr
 
 
-def _measure(evidence: Path, kind: str, item_id: str) -> dict[str, object]:
-    first_stdout, first_stderr = _run_chunk(evidence, kind, item_id, 1)
+def _measure_view(evidence: Path, kind: str, item_id: str, view: str) -> dict[str, object]:
+    first_stdout, first_stderr = _run_chunk(evidence, kind, item_id, view, 1)
     match = STATUS_RE.search(first_stderr)
     if match is None:
         raise RuntimeError(f"reader status is not parseable for {item_id}: {first_stderr.strip()}")
@@ -74,24 +83,45 @@ def _measure(evidence: Path, kind: str, item_id: str) -> dict[str, object]:
     stdout = first_stdout
     statuses = [first_stderr]
     for chunk in range(2, total_chunks + 1):
-        chunk_stdout, chunk_stderr = _run_chunk(evidence, kind, item_id, chunk)
+        chunk_stdout, chunk_stderr = _run_chunk(evidence, kind, item_id, view, chunk)
         chunk_match = STATUS_RE.search(chunk_stderr)
         if chunk_match is None or int(chunk_match.group("chunks")) != total_chunks:
             raise RuntimeError(f"reader chunk status changed for {item_id}: {chunk_stderr.strip()}")
         output_bytes += int(chunk_match.group("output"))
         stdout += chunk_stdout
         statuses.append(chunk_stderr)
-    values: dict[str, int] = {}
-    for field, pattern in COUNT_PATTERNS.items():
-        matches = pattern.findall(stdout)
-        if len(matches) != 1:
-            raise RuntimeError(f"expected exactly one {field} for {item_id}, found {len(matches)}")
-        values[field] = int(matches[0])
     return {
         "bytes_read": output_bytes,
         "view_bytes": view_bytes,
         "chunks_complete": len(statuses) == total_chunks
         and statuses[-1].find("end of item view") >= 0,
+        "output": stdout,
+    }
+
+
+def _measure(
+    evidence: Path, kind: str, item_id: str, views: list[str]
+) -> dict[str, object]:
+    if not views or "triage" not in views or len(views) != len(set(views)):
+        raise RuntimeError(f"ledger record for {item_id} has invalid declared views")
+    measurements = {
+        view: _measure_view(evidence, kind, item_id, view) for view in views
+    }
+    values: dict[str, int] = {}
+    triage_output = str(measurements["triage"]["output"])
+    for field, pattern in COUNT_PATTERNS.items():
+        matches = pattern.findall(triage_output)
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected exactly one {field} for {item_id}, found {len(matches)}"
+            )
+        values[field] = int(matches[0])
+    return {
+        "bytes_read": sum(int(item["bytes_read"]) for item in measurements.values()),
+        "view_bytes": sum(int(item["view_bytes"]) for item in measurements.values()),
+        "chunks_complete": all(
+            bool(item["chunks_complete"]) for item in measurements.values()
+        ),
         **values,
     }
 
@@ -107,7 +137,23 @@ def rebuild(evidence: Path, pool: Path, ledger: Path, output: Path, diff_output:
     for candidate in candidates:
         item_id = str(candidate["id"])
         record = dict(records[item_id])
-        measured = _measure(evidence, str(candidate["kind"]), item_id)
+        missing_gate_fields = sorted(CONTRIBUTION_GATE_FIELDS - record.keys())
+        if missing_gate_fields:
+            raise RuntimeError(
+                f"ledger record for {item_id} is missing Contribution Gate fields: "
+                + ", ".join(missing_gate_fields)
+            )
+        views = record.get("views_read")
+        if not isinstance(views, list) or not all(
+            isinstance(view, str) and view for view in views
+        ):
+            raise RuntimeError(f"ledger record for {item_id} has invalid declared views")
+        gate_views = record.get("contribution_gate_evidence_views")
+        if not isinstance(gate_views, list) or not set(gate_views).issubset(views):
+            raise RuntimeError(
+                f"ledger record for {item_id} has unread Contribution Gate evidence views"
+            )
+        measured = _measure(evidence, str(candidate["kind"]), item_id, views)
         old = {
             "views_read": record["views_read"],
             "bytes_read": record["bytes_read"],
@@ -116,7 +162,6 @@ def rebuild(evidence: Path, pool: Path, ledger: Path, output: Path, diff_output:
             "maintainer_count": record["maintainer_count"],
             "bot_count": record["bot_count"],
         }
-        record["views_read"] = ["triage"]
         for field in ("bytes_read", "chunks_complete", "human_count", "maintainer_count", "bot_count"):
             record[field] = measured[field]
         rebuilt.append(record)
