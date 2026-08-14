@@ -232,9 +232,7 @@ def _report_lines_with_visibility(path: Path) -> list[tuple[str, bool]]:
     result: list[tuple[str, bool]] = []
     fence_character: str | None = None
     fence_length = 0
-    for line_number, line in enumerate(
-        path.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    for line in path.read_text(encoding="utf-8").splitlines():
         if fence_character is not None:
             result.append((line, False))
             if re.fullmatch(
@@ -276,7 +274,7 @@ def _report_selection_positions(path: Path) -> dict[str, tuple[str, int]]:
     """Return the detailed analytic report placement for each selected item."""
     positions: dict[str, tuple[str, int]] = {}
     section: str | None = None
-    for line_number, raw_line in enumerate(_visible_report_lines(path), start=1):
+    for raw_line in _visible_report_lines(path):
         line = raw_line.rstrip()
         if line.startswith("## "):
             heading = line[3:]
@@ -331,7 +329,10 @@ def _report_contribution_gate_records(path: Path) -> dict[str, dict[str, object]
     for offset, entry_start in enumerate(entry_starts):
         entry_end = entry_starts[offset + 1] if offset + 1 < len(entry_starts) else len(lines)
         title = ORDERED_REPORT_ENTRY_RE.fullmatch(lines[entry_start])
-        assert title is not None
+        if title is None:
+            raise ManifestError(
+                f"{CONTRIBUTION_GATE_SECTION} entry has an invalid ordered-list title"
+            )
         item_ids = {
             match.group("id") for match in REPORT_LINK_ID_RE.finditer(title.group("body"))
         }
@@ -821,6 +822,38 @@ def _git_provenance(directory: Path) -> dict[str, object] | None:
     }
 
 
+def _verified_current_collector_provenance(
+    evidence_header: dict[str, str],
+) -> dict[str, object]:
+    current = _git_provenance(Path(__file__).resolve().parent)
+    if current is None:
+        raise ManifestError("cannot verify the current collector checkout provenance")
+    expected = {
+        "head": evidence_header["collector_started_worktree_head"],
+        "dirty": evidence_header["collector_started_worktree_dirty"] == "true",
+        "tracked_diff_sha256": evidence_header[
+            "collector_started_worktree_tracked_diff_sha256"
+        ],
+        "untracked_sha256": evidence_header[
+            "collector_started_worktree_untracked_sha256"
+        ],
+        "worktree_snapshot_sha256": evidence_header[
+            "collector_started_worktree_snapshot_sha256"
+        ],
+    }
+    mismatched = [
+        field
+        for field, expected_value in expected.items()
+        if current.get(field) != expected_value
+    ]
+    if mismatched:
+        raise ManifestError(
+            "evidence collector-start provenance does not match the current collector "
+            "checkout: " + ", ".join(mismatched)
+        )
+    return current
+
+
 def _read_polish_review(path: Path, report: Path) -> dict[str, object]:
     try:
         review = json.loads(path.read_text(encoding="utf-8"))
@@ -1008,6 +1041,8 @@ def _validate_index_trace(evidence: Path, index_trace: Path) -> dict[str, set[st
             raise ManifestError(f"index trace line {line_number} does not match the expected index page")
         progress[kind] += len(item_ids)
     for kind, total in ((kind, len(items)) for kind, items in expected.items()):
+        if total == 0 and kind not in empty_pages:
+            raise ManifestError(f"index trace is missing the empty {kind} index page")
         if progress[kind] != total:
             raise ManifestError(f"index trace does not completely cover the {kind} index")
     return {kind: set(items) for kind, items in expected.items()}
@@ -1320,7 +1355,10 @@ def _validate_gate_source_urls(
 
     for url in record["contribution_gate_evidence_urls"]:
         url_match = CONTRIBUTION_GATE_EVIDENCE_URL_RE.fullmatch(url)
-        assert url_match is not None
+        if url_match is None:
+            raise ManifestError(
+                f"{item_id} has an invalid Contribution Gate evidence URL: {url}"
+            )
         if url_match.group("locator") is None:
             if (
                 "body" not in gate_views
@@ -1418,8 +1456,12 @@ def write_manifest(
     polish_review: Path,
     output: Path,
 ) -> None:
-    validator = _run_validator(report, evidence)
     evidence_header = _evidence_front_matter(evidence)
+    # Check before replaying renderer-owned source lines and again after every
+    # source-controlled subprocess has finished.
+    skill_worktree = _verified_current_collector_provenance(evidence_header)
+    collector_worktree = _git_provenance(evidence.parent)
+    validator = _run_validator(report, evidence)
     records = _read_ledger(ledger)
     report_ids = _report_ids(report)
     candidate_kinds = _read_candidate_pool(candidate_pool, evidence, index_trace)
@@ -1449,6 +1491,7 @@ def write_manifest(
     triage_replay = _validate_ledger_triage_replays(records, evidence, candidate_kinds)
     review = _read_polish_review(polish_review, report)
     contribution_gate_policy = _read_contribution_gate_policy()
+    skill_worktree = _verified_current_collector_provenance(evidence_header)
     manifest = {
         "schema_version": "1.4",
         "generated_at": datetime.now(UTC).isoformat(),
@@ -1475,8 +1518,8 @@ def write_manifest(
         "index_trace": {"path": str(index_trace), "sha256": _sha256(index_trace)},
         "style_review": {"path": str(polish_review), "sha256": _sha256(polish_review), "record": review},
         "contribution_gate_policy": contribution_gate_policy,
-        "collector_worktree": _git_provenance(evidence.parent),
-        "skill_worktree": _git_provenance(Path(__file__).resolve().parent),
+        "collector_worktree": collector_worktree,
+        "skill_worktree": skill_worktree,
         "validator": validator,
         "triage_replay": triage_replay,
     }

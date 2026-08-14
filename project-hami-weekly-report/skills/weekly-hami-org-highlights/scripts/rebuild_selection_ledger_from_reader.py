@@ -132,7 +132,8 @@ def rebuild(evidence: Path, pool: Path, ledger: Path, output: Path, diff_output:
     rebuilt: list[dict[str, object]] = []
     diff_rows = [
         "id\told_bytes_read\treader_bytes_read\told_chunks_complete\treader_chunks_complete"
-        "\told_human\treader_human\told_maintainer\treader_maintainer\told_bot\treader_bot\treader_view_bytes"
+        "\told_human\treader_human\told_maintainer\treader_maintainer\told_bot\treader_bot"
+        "\treader_view_bytes_total"
     ]
     for candidate in candidates:
         item_id = str(candidate["id"])

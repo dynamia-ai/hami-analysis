@@ -202,7 +202,7 @@ Data Limitations
 
 front matter 包含 schema 版本、组织、生成时间、时区、本地和 UTC 周期、事项数量、warning 数量与 `collection_status`，以及 collector 在首个 GitHub 请求前记录的 Git HEAD、dirty 状态、tracked diff 和 untracked inventory 哈希。工作树快照摘要由这些分量规范化计算，避免不同 clean commit 产生相同摘要；validator 和 manifest 会重新计算并交叉校验。索引只记录事实，不判断重要性。Search 截断、分页不完整、非对象候选项或事项端点失败会把 evidence 标记为 `partial`；正式周报 validator 会拒绝 partial evidence。
 
-正式周报还必须附带 index trace、candidate-pool、selection ledger、Tech-Doc-Style-Chinese 润色记录和 run manifest：index trace 记录实际返回的全部索引页；candidate-pool 包含 evidence 中全部 PR 和最多 24 个 Issue 工程候选；ledger 为候选池每项记录索引信号、读取视图/实际输出字节数、块完整性、人类/maintainer/bot 计数、Contribution Gates 判定与来源 URL、选择或排除原因和排序；风格记录将输入稿与已审查的最终报告哈希绑定到所用的 Tech-Doc-Style-Chinese Skill。正式链路只接受由同一 checkout 中当前 collector 生成的 evidence，不接受旧版、手工编辑或其他 renderer 生成的同版本文件。manifest 重新校验这些输入文件及哈希，绑定 Skill 内固定的上游 Contribution Gates commit/blob 和预审策略正文哈希，重放每条 reader 输出并核对 ledger 的字节数、块完整性、活动计数和门禁来源 URL，再执行该 Skill 的 `scripts/lint_copy_rules.py`。活动 URL 必须来自 fenced GitHub 正文之外的 collector source 行，并归属于 maintainer 或 PR 作者；PR 根 URL 只允许与 `triage` metadata 和非空 `body` 视图共同证明正文。报告中的共用 `证据来源` 只承担事项级导航与周期活动摘要；门禁的精确 deep link、读取视图和 actor 归因以 ledger 与 manifest 为准。manifest 还会拒绝可见判定依据与 ledger 不一致，或已确认违规事项出现在独立章节之外。Skill 自带 `record_candidate_pool.py`、`record_polish_review.py` 和 `write_run_manifest.py` 用于完成这一步。
+正式周报还必须附带 index trace、candidate-pool、selection ledger、Tech-Doc-Style-Chinese 润色记录和 run manifest：index trace 记录实际返回的全部索引页；candidate-pool 包含 evidence 中全部 PR 和最多 24 个 Issue 工程候选；ledger 为候选池每项记录索引信号、读取视图/实际输出字节数、块完整性、人类/maintainer/bot 计数、Contribution Gates 判定与来源 URL、选择或排除原因和排序；风格记录将输入稿与已审查的最终报告哈希绑定到所用的 Tech-Doc-Style-Chinese Skill。正式流程只接受由同一 checkout 中当前 collector 生成的 evidence，不接受旧版、手工编辑或其他 renderer 生成的同版本文件。manifest 会在重放前后，把 evidence 中的 collector-start Git HEAD、dirty 状态、tracked diff、untracked inventory 和 worktree snapshot，与当前 Skill 所在且同时包含 collector 源码的 checkout 状态逐项比较；任一不一致或无法读取 Git 状态时均拒绝继续。随后，manifest 重新校验输入文件及哈希，绑定 Skill 内固定的上游 Contribution Gates commit/blob 和预审策略正文哈希，重放每条 reader 输出并核对 ledger 的字节数、块完整性、活动计数和门禁来源 URL，再执行该 Skill 的 `scripts/lint_copy_rules.py`。活动 URL 必须来自 fenced GitHub 正文之外的 collector source 行，并归属于 maintainer 或 PR 作者；PR 根 URL 只允许与 `triage` metadata 和非空 `body` 视图共同证明正文。报告中的共用 `证据来源` 只承担事项级导航与周期活动摘要；门禁的精确 deep link、读取视图和 actor 归因以 ledger 与 manifest 为准。manifest 还会拒绝可见判定依据与 ledger 不一致，或已确认违规事项出现在独立章节之外。Skill 自带 `record_candidate_pool.py`、`record_polish_review.py` 和 `write_run_manifest.py` 用于完成这一步。
 
 每个事项使用确定性的开始和结束标记：
 
@@ -309,6 +309,7 @@ jobs:
 - Contribution Gates 评估只能确认 evidence 中存在可归因直接证据的违规，不能证明其余 PR 合规。commit trailer、commit message 作者身份、硬件范围和 AI 作者身份通常不可判定；缺少证据不得作为违规依据。
 - Contribution Gates 评估覆盖正式 evidence 中的全部 PR；「活跃」指采集周期内存在活动，包含当前已经关闭或合并的 PR。当前六项门禁针对 PR、改动、commit 和 review thread，普通 Issue 使用 `not_applicable`。
 - manifest 只能验证候选覆盖、证据来源和报告交付一致性，不能自动证明分析者对 GitHub 文本的语义判断正确；已确认违规仍需人工复核。普通 AI 使用披露本身不是违规证据。
+- collector-start 来源校验只能证明 evidence 声明的源码状态与执行 manifest 时的 Skill/collector Git checkout 一致，不能以密码学方式证明被 Git 忽略的 evidence 未经本地修改。需要抵抗本地伪造时，必须另行使用绑定 evidence 哈希的可信签名或不可伪造的回执。
 - Search Issues 单个查询最多暴露 1,000 条结果；当前 collector 会把该情形标记为 partial，正式报告不会放行，后续应按仓库或时间分片完成候选发现；
 - 评论类端点使用 `since` 减少历史分页，因此不能保证包含周期前的完整评论上下文；
 - `mergeable` 是 GitHub 当前返回的可空快照，不等价于「可合并」结论；

@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+from hami_github_activity.provenance import capture_worktree_snapshot
 from test_skill_report_validator import EVIDENCE, GATED_REPORT, VALID_REPORT
 
 
@@ -149,6 +150,101 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _manifest_module() -> object:
+    spec = importlib.util.spec_from_file_location("weekly_manifest_fixture", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _bind_evidence_to_current_collector(content: str) -> str:
+    provenance = capture_worktree_snapshot(SCRIPT.parent)
+    assert provenance is not None
+    values = {
+        "collector_started_worktree_snapshot_sha256": provenance[
+            "worktree_snapshot_sha256"
+        ],
+        "collector_started_worktree_head": provenance["head"],
+        "collector_started_worktree_dirty": str(provenance["dirty"]).lower(),
+        "collector_started_worktree_tracked_diff_sha256": provenance[
+            "tracked_diff_sha256"
+        ],
+        "collector_started_worktree_untracked_sha256": provenance["untracked_sha256"],
+    }
+    for field, value in values.items():
+        content, count = re.subn(
+            rf"(?m)^{re.escape(field)}:.*$",
+            f'{field}: "{value}"',
+            content,
+        )
+        assert count == 1
+    return content
+
+
+def _initialize_git_repository(path: Path) -> None:
+    subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    for key, value in (
+        ("user.email", "manifest@example.test"),
+        ("user.name", "Manifest Test"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", ""),
+        ("core.quotePath", "false"),
+    ):
+        subprocess.run(
+            ["git", "config", key, value],
+            cwd=path,
+            check=True,
+            capture_output=True,
+        )
+    (path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "add", "tracked.txt"], cwd=path, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=path,
+        check=True,
+        capture_output=True,
+    )
+
+
+def _change_bound_tracked_diff(content: str) -> str:
+    def header(field: str) -> str:
+        match = re.search(rf'(?m)^{re.escape(field)}: "(?P<value>[^"]+)"$', content)
+        assert match is not None
+        return match.group("value")
+
+    tracked_diff = header("collector_started_worktree_tracked_diff_sha256")
+    replacement = ("0" if tracked_diff != "0" * 64 else "1") * 64
+    dirty = header("collector_started_worktree_dirty") == "true"
+    snapshot = hashlib.sha256(
+        json.dumps(
+            {
+                "dirty": dirty,
+                "head": header("collector_started_worktree_head"),
+                "tracked_diff_sha256": replacement,
+                "untracked_sha256": header(
+                    "collector_started_worktree_untracked_sha256"
+                ),
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    content = re.sub(
+        r'(?m)^collector_started_worktree_tracked_diff_sha256:.*$',
+        f'collector_started_worktree_tracked_diff_sha256: "{replacement}"',
+        content,
+    )
+    return re.sub(
+        r'(?m)^collector_started_worktree_snapshot_sha256:.*$',
+        f'collector_started_worktree_snapshot_sha256: "{snapshot}"',
+        content,
+    )
+
+
 def _record(item_id: str, section: str | None = None, rank: int | None = None) -> dict[str, object]:
     section = section or {
         "Project-HAMi/HAMi#1": "Must Pay Attention",
@@ -206,8 +302,11 @@ def _run(
     style_skill_sha256: str | None = None,
     input_report_path: str | None = None,
     report_content: str = VALID_REPORT,
+    bind_collector_provenance: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     tmp_path.mkdir(parents=True, exist_ok=True)
+    if bind_collector_provenance:
+        evidence_content = _bind_evidence_to_current_collector(evidence_content)
     evidence = tmp_path / "evidence.md"
     report = tmp_path / "report.md"
     ledger_path = tmp_path / "selection-ledger.jsonl"
@@ -264,9 +363,9 @@ def _run(
         ),
         encoding="utf-8",
     )
-    style_skill.parent.mkdir()
+    style_skill.parent.mkdir(parents=True, exist_ok=True)
     style_skill.write_text("---\nname: tech-doc-style-chinese\n---\n", encoding="utf-8")
-    lint_script.parent.mkdir()
+    lint_script.parent.mkdir(parents=True, exist_ok=True)
     lint_script.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
     polish_review.write_text(
         json.dumps(
@@ -381,8 +480,20 @@ def test_run_manifest_records_hashes_and_requires_report_selection(tmp_path: Pat
         "checked_views": 3,
         "result": "passed",
     }
-    assert manifest["collector_started_worktree"]["head"] == "a" * 40
-    assert manifest["collector_started_worktree"]["dirty"] is False
+    assert manifest["collector_started_worktree"] == {
+        key: manifest["skill_worktree"][key]
+        for key in (
+            "head",
+            "dirty",
+            "tracked_diff_sha256",
+            "untracked_sha256",
+            "worktree_snapshot_sha256",
+        )
+    }
+    assert (
+        manifest["collector_started_worktree_snapshot_sha256"]
+        == manifest["skill_worktree"]["worktree_snapshot_sha256"]
+    )
     assert "worktree_snapshot_sha256" in manifest["skill_worktree"]
     assert manifest["contribution_gate_policy"]["source_commit"] == (
         "183239325af912a8ecd5cff19f99f1251c9acf8d"
@@ -394,18 +505,7 @@ def test_run_manifest_records_hashes_and_requires_report_selection(tmp_path: Pat
 
 
 def test_run_manifest_handles_non_utf8_untracked_filename(tmp_path: Path) -> None:
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    for key, value in (
-        ("user.email", "manifest@example.test"),
-        ("user.name", "Manifest Test"),
-        ("commit.gpgsign", "false"),
-        ("core.hooksPath", ""),
-        ("core.quotePath", "false"),
-    ):
-        subprocess.run(["git", "config", key, value], cwd=tmp_path, check=True, capture_output=True)
-    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
+    _initialize_git_repository(tmp_path)
     raw_name = b"non-utf8-\xff.txt"
     non_utf8 = tmp_path / os.fsdecode(raw_name)
     non_utf8.write_bytes(b"untracked")
@@ -419,6 +519,127 @@ def test_run_manifest_handles_non_utf8_untracked_filename(tmp_path: Path) -> Non
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     entries = manifest["collector_worktree"]["untracked"]
     assert any(os.fsencode(entry["path"]) == raw_name for entry in entries)
+
+
+def test_manifest_and_collector_provenance_algorithms_remain_identical(
+    tmp_path: Path,
+) -> None:
+    _initialize_git_repository(tmp_path)
+    module = _manifest_module()
+
+    assert module._git_provenance(tmp_path) == capture_worktree_snapshot(tmp_path)
+
+    (tmp_path / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    (tmp_path / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    (tmp_path / os.fsdecode(b"non-utf8-\xff.txt")).write_bytes(b"binary\xff")
+
+    assert module._git_provenance(tmp_path) == capture_worktree_snapshot(tmp_path)
+
+
+def test_run_manifest_rechecks_collector_provenance_after_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _manifest_module()
+    start = {
+        "root": str(tmp_path),
+        "head": "a" * 40,
+        "dirty": False,
+        "tracked_diff_sha256": "b" * 64,
+        "untracked": [],
+        "untracked_sha256": "c" * 64,
+        "worktree_snapshot_sha256": "d" * 64,
+    }
+    changed = {
+        **start,
+        "tracked_diff_sha256": "e" * 64,
+        "worktree_snapshot_sha256": "f" * 64,
+    }
+    evidence_header = {
+        "collector_started_worktree_head": start["head"],
+        "collector_started_worktree_dirty": "false",
+        "collector_started_worktree_tracked_diff_sha256": start[
+            "tracked_diff_sha256"
+        ],
+        "collector_started_worktree_untracked_sha256": start[
+            "untracked_sha256"
+        ],
+        "collector_started_worktree_snapshot_sha256": start[
+            "worktree_snapshot_sha256"
+        ],
+    }
+    observations = iter((start, None, changed))
+    monkeypatch.setattr(module, "_git_provenance", lambda _: next(observations))
+    monkeypatch.setattr(module, "_evidence_front_matter", lambda _: evidence_header)
+    monkeypatch.setattr(module, "_run_validator", lambda *_: {})
+    monkeypatch.setattr(module, "_read_ledger", lambda _: [])
+    monkeypatch.setattr(module, "_report_ids", lambda _: set())
+    monkeypatch.setattr(module, "_read_candidate_pool", lambda *_: {})
+    monkeypatch.setattr(module, "_validate_ledger_report_placements", lambda *_: None)
+    monkeypatch.setattr(module, "_validate_contribution_gate_contract", lambda *_: None)
+    monkeypatch.setattr(module, "_validate_ledger_triage_replays", lambda *_: {})
+    monkeypatch.setattr(module, "_read_polish_review", lambda *_: {})
+    monkeypatch.setattr(module, "_read_contribution_gate_policy", lambda: {})
+    output = tmp_path / "manifest.json"
+
+    with pytest.raises(
+        module.ManifestError,
+        match="provenance does not match.*tracked_diff_sha256.*worktree_snapshot_sha256",
+    ):
+        module.write_manifest(
+            tmp_path / "evidence.md",
+            tmp_path / "report.md",
+            tmp_path / "ledger.jsonl",
+            tmp_path / "candidate-pool.json",
+            tmp_path / "index-trace.jsonl",
+            tmp_path / "polish-review.json",
+            output,
+        )
+    assert not output.exists()
+
+
+def test_run_manifest_rejects_stale_collector_provenance(tmp_path: Path) -> None:
+    result = _run(
+        tmp_path,
+        "".join(
+            json.dumps(_record(item_id)) + "\n"
+            for item_id in (
+                "Project-HAMi/HAMi#1",
+                "Project-HAMi/HAMi#2",
+                "Project-HAMi/HAMi#4",
+            )
+        ),
+        bind_collector_provenance=False,
+    )
+
+    assert result.returncode != 0
+    assert (
+        "evidence collector-start provenance does not match the current collector checkout"
+        in result.stderr
+    )
+
+
+def test_run_manifest_rejects_self_consistent_but_different_source_snapshot(
+    tmp_path: Path,
+) -> None:
+    evidence = _change_bound_tracked_diff(
+        _bind_evidence_to_current_collector(AUDITABLE_EVIDENCE)
+    )
+    result = _run(
+        tmp_path,
+        "".join(
+            json.dumps(_record(item_id)) + "\n"
+            for item_id in (
+                "Project-HAMi/HAMi#1",
+                "Project-HAMi/HAMi#2",
+                "Project-HAMi/HAMi#4",
+            )
+        ),
+        evidence_content=evidence,
+        bind_collector_provenance=False,
+    )
+
+    assert result.returncode != 0
+    assert "tracked_diff_sha256" in result.stderr
 
 
 def test_run_manifest_rejects_missing_selected_report_item(tmp_path: Path) -> None:
@@ -550,6 +771,28 @@ def test_run_manifest_sums_all_reader_chunks_for_each_declared_view(tmp_path: Pa
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize(
+    ("item_id", "kind"),
+    (
+        ("Project-HAMi/HAMi#1", "issue"),
+        ("Project-HAMi/HAMi#2", "pull_request"),
+        ("Project-HAMi/HAMi#4", "issue"),
+    ),
+)
+def test_auditable_evidence_keeps_fixed_triage_byte_contract(
+    tmp_path: Path,
+    item_id: str,
+    kind: str,
+) -> None:
+    assert _reader_view_output_bytes(
+        tmp_path,
+        AUDITABLE_EVIDENCE,
+        kind,
+        item_id,
+        "triage",
+    ) == TRIAGE_METRICS[item_id]["bytes_read"]
+
+
 def test_run_manifest_accepts_confirmed_gate_item_only_in_quarantine(tmp_path: Path) -> None:
     records = (
         _record("Project-HAMi/HAMi#1"),
@@ -564,6 +807,32 @@ def test_run_manifest_accepts_confirmed_gate_item_only_in_quarantine(tmp_path: P
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_run_manifest_rejects_relative_gate_reference_outside_quarantine(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        "## Executive Summary\n\n"
+        "[same PR](/Project-HAMi/HAMi/pull/2) must remain quarantined.\n",
+        1,
+    )
+    records = (
+        _record("Project-HAMi/HAMi#1"),
+        _confirmed_pr_record(),
+        _record("Project-HAMi/HAMi#4"),
+    )
+
+    result = _run(
+        tmp_path,
+        "".join(json.dumps(record) + "\n" for record in records),
+        report_content=report,
+    )
+
+    assert result.returncode != 0
+    assert "canonical [Project-HAMi/REPO#NUMBER](GitHub URL) form" in result.stderr
+    assert "Contribution Gate item must not appear outside" in result.stderr
 
 
 def test_run_manifest_rejects_gate_entry_hidden_inside_fenced_code(
@@ -589,12 +858,7 @@ def test_run_manifest_rejects_gate_entry_hidden_inside_fenced_code(
     )
 
     assert result.returncode != 0
-    assert (
-        "selected ledger item is absent from a detailed analytic report entry"
-        in result.stderr
-        or "missing confirmed items" in result.stderr
-        or "must not contain fenced code blocks" in result.stderr
-    )
+    assert "must not contain fenced code blocks" in result.stderr
 
 
 def test_run_manifest_rejects_gate_reference_in_another_sections_fence(
@@ -621,9 +885,9 @@ def test_run_manifest_rejects_gate_reference_in_another_sections_fence(
 
     assert result.returncode != 0
     assert (
-        "must not appear outside" in result.stderr
-        or "must appear only" in result.stderr
-    )
+        "Contribution Gate item must not appear outside "
+        "Active Contributions Not Meeting Contribution Gates"
+    ) in result.stderr
 
 
 def test_run_manifest_rejects_gate_label_in_another_sections_fence(
@@ -1263,6 +1527,37 @@ def test_contribution_gate_policy_body_is_pinned(tmp_path: Path) -> None:
         raise AssertionError("mutated Contribution Gates policy body was accepted")
 
 
+def test_manifest_and_validator_keep_independent_gate_contracts_synchronized() -> None:
+    manifest_module = _manifest_module()
+    validator_spec = importlib.util.spec_from_file_location(
+        "weekly_validator_contract_sync",
+        SCRIPT.with_name("validate_report.py"),
+    )
+    assert validator_spec is not None and validator_spec.loader is not None
+    validator_module = importlib.util.module_from_spec(validator_spec)
+    validator_spec.loader.exec_module(validator_module)
+
+    assert manifest_module.CONTRIBUTION_GATE_IDS == validator_module.CONTRIBUTION_GATE_IDS
+    for name in (
+        "RAW_HTML_RE",
+        "INLINE_MARKDOWN_LINK_RE",
+        "BACKTICK_TOKEN_RE",
+        "CONTRIBUTION_GATE_LIST_RE",
+    ):
+        manifest_pattern = getattr(manifest_module, name)
+        validator_pattern = getattr(validator_module, name)
+        assert manifest_pattern.pattern == validator_pattern.pattern
+        assert manifest_pattern.flags == validator_pattern.flags
+    for value in (
+        "   - 门禁判定依据：[证据](https://example.test) **明确**。",
+        "   - 未满足的门禁&#58; `review-replies`",
+        "   - 恢复条件：作者给出可验证的技术回复。",
+    ):
+        assert manifest_module._rendered_gate_text(value) == (
+            validator_module._rendered_gate_text(value)
+        )
+
+
 def test_index_trace_accepts_one_empty_page_for_an_empty_kind(tmp_path: Path) -> None:
     spec = importlib.util.spec_from_file_location("weekly_manifest_empty_index_test", SCRIPT)
     assert spec is not None and spec.loader is not None
@@ -1307,3 +1602,123 @@ def test_index_trace_accepts_one_empty_page_for_an_empty_kind(tmp_path: Path) ->
         "issue": set(),
         "pull_request": {"Project-HAMi/HAMi#2"},
     }
+
+
+@pytest.mark.parametrize(
+    ("present_kind", "present_item", "missing_kind"),
+    (
+        ("pull_request", "Project-HAMi/HAMi#2", "issue"),
+        ("issue", "Project-HAMi/HAMi#1", "pull_request"),
+    ),
+)
+def test_index_trace_requires_an_explicit_page_for_each_empty_kind(
+    tmp_path: Path,
+    present_kind: str,
+    present_item: str,
+    missing_kind: str,
+) -> None:
+    module = _manifest_module()
+    evidence = tmp_path / "evidence.md"
+    trace = tmp_path / "index-trace.jsonl"
+    evidence.write_text(
+        f"<!-- ITEM_START {present_kind} {present_item} -->\n"
+        f"<!-- ITEM_END {present_kind} {present_item} -->\n",
+        encoding="utf-8",
+    )
+    trace.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "view": "index",
+                "evidence_sha256": _sha256(evidence),
+                "kind": present_kind,
+                "offset": 0,
+                "item_ids": [present_item],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        module.ManifestError,
+        match=rf"index trace is missing the empty {missing_kind} index page",
+    ):
+        module._validate_index_trace(evidence, trace)
+
+
+def test_index_trace_rejects_empty_page_for_nonempty_index(tmp_path: Path) -> None:
+    module = _manifest_module()
+    evidence = tmp_path / "evidence.md"
+    trace = tmp_path / "index-trace.jsonl"
+    evidence.write_text(
+        "<!-- ITEM_START issue Project-HAMi/HAMi#1 -->\n"
+        "<!-- ITEM_END issue Project-HAMi/HAMi#1 -->\n",
+        encoding="utf-8",
+    )
+    trace.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "view": "index",
+                "evidence_sha256": _sha256(evidence),
+                "kind": "issue",
+                "offset": 0,
+                "item_ids": [],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        module.ManifestError,
+        match="has an empty page for a non-empty index",
+    ):
+        module._validate_index_trace(evidence, trace)
+
+
+def test_index_trace_rejects_repeated_empty_page(tmp_path: Path) -> None:
+    module = _manifest_module()
+    evidence = tmp_path / "evidence.md"
+    trace = tmp_path / "index-trace.jsonl"
+    evidence.write_text(
+        "<!-- ITEM_START pull_request Project-HAMi/HAMi#2 -->\n"
+        "<!-- ITEM_END pull_request Project-HAMi/HAMi#2 -->\n",
+        encoding="utf-8",
+    )
+    empty_issue = {
+        "schema_version": "1.0",
+        "view": "index",
+        "evidence_sha256": _sha256(evidence),
+        "kind": "issue",
+        "offset": 0,
+        "item_ids": [],
+    }
+    trace.write_text(
+        json.dumps(empty_issue) + "\n" + json.dumps(empty_issue) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        module.ManifestError,
+        match="repeats the empty issue index page",
+    ):
+        module._validate_index_trace(evidence, trace)
+
+
+def test_gate_source_validation_rejects_malformed_url_explicitly() -> None:
+    module = _manifest_module()
+
+    with pytest.raises(
+        module.ManifestError,
+        match="has an invalid Contribution Gate evidence URL",
+    ):
+        module._validate_gate_source_urls(
+            {
+                "contribution_gate_evidence_views": [],
+                "contribution_gate_evidence_urls": ["not-a-github-url"],
+            },
+            {"triage": ""},
+            "Project-HAMi/HAMi#2",
+        )

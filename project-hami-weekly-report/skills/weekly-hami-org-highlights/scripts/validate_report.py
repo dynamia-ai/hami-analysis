@@ -352,12 +352,15 @@ def _semantic_github_item(value: str) -> tuple[str, str, int] | None:
     normalized = _semantic_reference(value).rstrip(".,;:!?，。；：！？、")
     if re.match(r"(?:www\.)?github\.com/", normalized, re.IGNORECASE):
         normalized = "https://" + normalized
-    elif re.match(r"Project-HAMi/", normalized, re.IGNORECASE):
-        normalized = "https://github.com/" + normalized
     try:
         parsed = urlsplit(normalized)
     except ValueError:
         return None
+    if not parsed.scheme and not parsed.netloc:
+        relative_path = posixpath.normpath("/" + parsed.path.lstrip("/"))
+        if re.match(r"/Project-HAMi/", relative_path, re.IGNORECASE):
+            normalized = "https://github.com" + relative_path
+            parsed = urlsplit(normalized)
     if parsed.scheme.casefold() not in {"", "http", "https"}:
         return None
     try:

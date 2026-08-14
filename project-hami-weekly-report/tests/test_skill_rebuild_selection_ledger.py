@@ -116,6 +116,9 @@ def test_rebuild_preserves_declared_views_and_contribution_gate_fields(
     assert {
         key: rebuilt_pull_request[key] for key in original_gate_fields
     } == original_gate_fields
+    diff_rows = (tmp_path / "reader-diff.tsv").read_text(encoding="utf-8").splitlines()
+    assert diff_rows[0].endswith("\treader_view_bytes_total")
+    assert diff_rows[2].split("\t")[-1] == "1008"
 
 
 def test_rebuild_rejects_legacy_rows_without_contribution_gate_fields(
@@ -132,3 +135,32 @@ def test_rebuild_rejects_legacy_rows_without_contribution_gate_fields(
 
     assert result.returncode != 0
     assert "missing Contribution Gate fields" in result.stderr
+
+
+def test_rebuild_rejects_unread_contribution_gate_view(tmp_path: Path) -> None:
+    records = [
+        _record("Project-HAMi/HAMi#1"),
+        _record("Project-HAMi/HAMi#2"),
+        _record("Project-HAMi/HAMi#4"),
+    ]
+    records[1]["contribution_gate_evidence_views"] = ["body"]
+
+    result = _run_rebuild(tmp_path, records)
+
+    assert result.returncode != 0
+    assert "has unread Contribution Gate evidence views" in result.stderr
+
+
+def test_rebuild_rejects_record_without_triage_view(tmp_path: Path) -> None:
+    records = [
+        _record("Project-HAMi/HAMi#1"),
+        _record("Project-HAMi/HAMi#2"),
+        _record("Project-HAMi/HAMi#4"),
+    ]
+    records[1]["views_read"] = ["body"]
+    records[1]["contribution_gate_evidence_views"] = ["body"]
+
+    result = _run_rebuild(tmp_path, records)
+
+    assert result.returncode != 0
+    assert "has invalid declared views" in result.stderr

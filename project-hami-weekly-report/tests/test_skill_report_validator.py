@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
@@ -14,6 +15,13 @@ SCRIPT = (
     / "scripts"
     / "validate_report.py"
 )
+SKILL = SCRIPT.parents[1] / "SKILL.md"
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "weekly_hami_report_validator_test", SCRIPT
+)
+assert VALIDATOR_SPEC is not None and VALIDATOR_SPEC.loader is not None
+VALIDATOR_MODULE = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(VALIDATOR_MODULE)
 
 COLLECTOR_HEAD = "a" * 40
 COLLECTOR_TRACKED_DIFF_SHA256 = "b" * 64
@@ -516,6 +524,10 @@ def test_case_variant_contribution_gate_link_cannot_bypass_quarantine(
 @pytest.mark.parametrize(
     "url",
     (
+        "/Project-HAMi/HAMi/pull/2",
+        "/x/../Project-HAMi/HAMi/pull/2",
+        "/%2e%2e/Project-HAMi/HAMi/pull/2",
+        "/foo/%2e%2e/Project-HAMi/HAMi/pull/2",
         "//github.com/Project-HAMi/HAMi/pull/2",
         "https://www.github.com/Project-HAMi/HAMi/pull/2",
         "https:///github.com/Project-HAMi/HAMi/pull/2",
@@ -599,6 +611,25 @@ def test_contribution_gate_ids_are_allowlisted_unique_and_policy_ordered(
 
     assert result.returncode != 0
     assert message in result.stderr
+
+
+def test_contribution_gate_ids_accept_multiple_values_in_policy_order(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "`review-replies`",
+        "`author-understanding`、`review-replies`",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_contribution_gate_scope_note_stays_synchronized_with_skill() -> None:
+    assert GATE_SCOPE_NOTE == VALIDATOR_MODULE.CONTRIBUTION_GATE_SCOPE_NOTE
+    assert SKILL.read_text(encoding="utf-8").count(GATE_SCOPE_NOTE) == 2
 
 
 def test_contribution_gate_section_requires_scope_note_and_gate_fields(tmp_path: Path) -> None:

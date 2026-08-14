@@ -64,11 +64,12 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, list[str], list[str]]:
 
 def _run(
     tmp_path: Path,
-    issue_candidates: list[str],
+    candidates: list[str],
     *,
     all_pull_requests: bool,
+    fixture: tuple[Path, Path, list[str], list[str]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    evidence, trace, _, _ = _fixture(tmp_path)
+    evidence, trace, _, _ = fixture or _fixture(tmp_path)
     output = tmp_path / "candidate-pool.json"
     command = [
         sys.executable,
@@ -80,7 +81,7 @@ def _run(
         "--output",
         str(output),
     ]
-    for item_id in issue_candidates:
+    for item_id in candidates:
         command.extend(("--candidate", item_id))
     if all_pull_requests:
         command.append("--all-pull-requests")
@@ -88,8 +89,14 @@ def _run(
 
 
 def test_candidate_pool_includes_all_pull_requests_beyond_old_cap(tmp_path: Path) -> None:
-    _, _, issues, pull_requests = _fixture(tmp_path)
-    result = _run(tmp_path, issues[:24], all_pull_requests=True)
+    fixture = _fixture(tmp_path)
+    _, _, issues, pull_requests = fixture
+    result = _run(
+        tmp_path,
+        issues[:24],
+        all_pull_requests=True,
+        fixture=fixture,
+    )
 
     assert result.returncode == 0, result.stderr
     pool = json.loads((tmp_path / "candidate-pool.json").read_text(encoding="utf-8"))
@@ -102,16 +109,50 @@ def test_candidate_pool_includes_all_pull_requests_beyond_old_cap(tmp_path: Path
 
 
 def test_candidate_pool_rejects_missing_pull_requests(tmp_path: Path) -> None:
-    _, _, issues, _ = _fixture(tmp_path)
-    result = _run(tmp_path, issues[:1], all_pull_requests=False)
+    fixture = _fixture(tmp_path)
+    _, _, issues, _ = fixture
+    result = _run(
+        tmp_path,
+        issues[:1],
+        all_pull_requests=False,
+        fixture=fixture,
+    )
 
     assert result.returncode != 0
     assert "must include every pull request" in result.stderr
 
 
 def test_candidate_pool_keeps_issue_cap(tmp_path: Path) -> None:
-    _, _, issues, _ = _fixture(tmp_path)
-    result = _run(tmp_path, issues, all_pull_requests=True)
+    fixture = _fixture(tmp_path)
+    _, _, issues, _ = fixture
+    result = _run(
+        tmp_path,
+        issues,
+        all_pull_requests=True,
+        fixture=fixture,
+    )
 
     assert result.returncode != 0
     assert "maximum is 24" in result.stderr
+
+
+def test_candidate_pool_accepts_explicit_complete_pull_request_scope(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    _, _, issues, pull_requests = fixture
+
+    result = _run(
+        tmp_path,
+        [*issues[:24], *pull_requests],
+        all_pull_requests=False,
+        fixture=fixture,
+    )
+
+    assert result.returncode == 0, result.stderr
+    pool = json.loads((tmp_path / "candidate-pool.json").read_text(encoding="utf-8"))
+    assert pool["pull_request_scope"] == "all_evidence"
+    assert [candidate["id"] for candidate in pool["candidates"]] == [
+        *issues[:24],
+        *pull_requests,
+    ]
