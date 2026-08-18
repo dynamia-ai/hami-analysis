@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record a bounded candidate pool selected from an evidence index-read trace."""
+"""Record a candidate pool selected from a complete evidence index-read trace."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ EVIDENCE_ID_RE = re.compile(
     r"^<!-- ITEM_START (?P<kind>issue|pull_request) (?P<id>Project-HAMi/[A-Za-z0-9_.-]+#\d+) -->[ \t]*$",
     re.MULTILINE,
 )
-MAX_PER_KIND = 24
+MAX_ISSUES = 24
 
 
 def _sha256(path: Path) -> str:
@@ -51,8 +51,24 @@ def _traced_items(path: Path, evidence_sha256: str) -> set[str]:
     return seen
 
 
-def record_candidate_pool(evidence: Path, index_trace: Path, candidate_ids: list[str], output: Path) -> None:
+def record_candidate_pool(
+    evidence: Path,
+    index_trace: Path,
+    candidate_ids: list[str],
+    output: Path,
+    *,
+    all_pull_requests: bool = False,
+) -> None:
     evidence_items = _evidence_items(evidence)
+    if all_pull_requests:
+        candidate_ids = [
+            *candidate_ids,
+            *(
+                item_id
+                for item_id, kind in evidence_items.items()
+                if kind == "pull_request" and item_id not in candidate_ids
+            ),
+        ]
     if not candidate_ids:
         raise ValueError("candidate pool must contain at least one item")
     if len(candidate_ids) != len(set(candidate_ids)):
@@ -72,15 +88,29 @@ def record_candidate_pool(evidence: Path, index_trace: Path, candidate_ids: list
     if invalid:
         raise ValueError("candidate pool has IDs absent from evidence: " + ", ".join(invalid))
     candidates = [{"id": item_id, "kind": evidence_items[item_id]} for item_id in candidate_ids]
-    for kind in ("issue", "pull_request"):
-        count = sum(candidate["kind"] == kind for candidate in candidates)
-        if count > MAX_PER_KIND:
-            raise ValueError(f"candidate pool has {count} {kind} items; maximum is {MAX_PER_KIND}")
+    issue_count = sum(candidate["kind"] == "issue" for candidate in candidates)
+    if issue_count > MAX_ISSUES:
+        raise ValueError(
+            f"candidate pool has {issue_count} issue items; maximum is {MAX_ISSUES}"
+        )
+    evidence_pull_requests = {
+        item_id for item_id, kind in evidence_items.items() if kind == "pull_request"
+    }
+    candidate_pull_requests = {
+        candidate["id"] for candidate in candidates if candidate["kind"] == "pull_request"
+    }
+    missing_pull_requests = sorted(evidence_pull_requests - candidate_pull_requests)
+    if missing_pull_requests:
+        raise ValueError(
+            "candidate pool must include every pull request in evidence; missing: "
+            + ", ".join(missing_pull_requests)
+        )
     result = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "created_at": datetime.now(UTC).isoformat(),
         "evidence": {"path": str(evidence), "sha256": evidence_sha256},
         "index_trace": {"path": str(index_trace), "sha256": _sha256(index_trace)},
+        "pull_request_scope": "all_evidence",
         "candidates": candidates,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +122,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--index-trace", type=Path, required=True)
     parser.add_argument("--candidate", action="append", default=[], metavar="PROJECT_HAMI_ID")
+    parser.add_argument(
+        "--all-pull-requests",
+        action="store_true",
+        help="include every pull request from the evidence file",
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -99,7 +134,13 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _parser().parse_args()
     try:
-        record_candidate_pool(args.evidence, args.index_trace, args.candidate, args.output)
+        record_candidate_pool(
+            args.evidence,
+            args.index_trace,
+            args.candidate,
+            args.output,
+            all_pull_requests=args.all_pull_requests,
+        )
     except (OSError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

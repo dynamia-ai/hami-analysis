@@ -1,8 +1,11 @@
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
 import sys
+
+import pytest
 
 
 SCRIPT = (
@@ -12,6 +15,13 @@ SCRIPT = (
     / "scripts"
     / "validate_report.py"
 )
+SKILL = SCRIPT.parents[1] / "SKILL.md"
+VALIDATOR_SPEC = importlib.util.spec_from_file_location(
+    "weekly_hami_report_validator_test", SCRIPT
+)
+assert VALIDATOR_SPEC is not None and VALIDATOR_SPEC.loader is not None
+VALIDATOR_MODULE = importlib.util.module_from_spec(VALIDATOR_SPEC)
+VALIDATOR_SPEC.loader.exec_module(VALIDATOR_MODULE)
 
 COLLECTOR_HEAD = "a" * 40
 COLLECTOR_TRACKED_DIFF_SHA256 = "b" * 64
@@ -87,6 +97,11 @@ COMMON_FIELDS = """   - 相关事项：{link}
 ISSUE_1 = "[Project-HAMi/HAMi#1](https://github.com/Project-HAMi/HAMi/issues/1)"
 PR_2 = "[Project-HAMi/HAMi#2](https://github.com/Project-HAMi/HAMi/pull/2)"
 ISSUE_4 = "[Project-HAMi/HAMi#4](https://github.com/Project-HAMi/HAMi/issues/4)"
+GATE_SCOPE_NOTE = (
+    "范围：覆盖本周期 evidence 中全部活跃 PR；“活跃”指采集周期内存在活动，"
+    "包含当前已关闭或已合并事项。普通 Issue 不适用当前六项门禁。"
+    "`no_confirmed_violation` 与 `insufficient_evidence` 均不代表门禁已通过。"
+)
 
 VALID_REPORT = f"""# Weekly HAMi Org Highlights
 
@@ -154,7 +169,38 @@ Evidence limitations:
 ## Active but Not Worth Investing This Week
 
 本周未发现。
+
+## Active Contributions Not Meeting Contribution Gates
+
+{GATE_SCOPE_NOTE}
+
+本周未发现。
 """
+
+
+def _gated_report() -> str:
+    report = VALID_REPORT.replace(f"2. {PR_2} 需要 maintainer review。\n", "")
+    action_start = report.index("## Pull Requests Requiring Action")
+    action_end = report.index("## Important Resolutions")
+    report = (
+        report[:action_start]
+        + "## Pull Requests Requiring Action\n\n本周未发现。\n\n"
+        + report[action_end:]
+    )
+    gate_entry = f"""1. **{PR_2}：review 回复未回应具体意见**
+
+{COMMON_FIELDS.format(link=PR_2)}   - 未满足的门禁：`review-replies`
+   - 门禁判定依据：maintainer 明确确认作者回复没有回应具体 review 意见。
+   - 恢复条件：作者针对该意见给出本人编写且可验证的技术回复。
+   - 建议投入类型：`quick review`
+"""
+    return report.replace(
+        f"## Active Contributions Not Meeting Contribution Gates\n\n{GATE_SCOPE_NOTE}\n\n本周未发现。",
+        f"## Active Contributions Not Meeting Contribution Gates\n\n{GATE_SCOPE_NOTE}\n\n{gate_entry.rstrip()}",
+    )
+
+
+GATED_REPORT = _gated_report()
 
 
 def _run(
@@ -386,3 +432,507 @@ def test_unterminated_fence_is_rejected(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "unterminated fenced code block" in result.stderr.lower()
+
+
+def test_confirmed_contribution_gate_entry_is_valid_and_self_contained(tmp_path: Path) -> None:
+    result = _run(tmp_path, GATED_REPORT)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "Executive Summary",
+        "Must Pay Attention",
+        "Worth Engineering Investment",
+        "Pull Requests Requiring Action",
+        "Important Resolutions",
+        "Emerging Engineering Themes",
+        "Recommended Resource Allocation",
+        "Active but Not Worth Investing This Week",
+    ),
+)
+def test_confirmed_contribution_gate_item_cannot_leak_into_old_sections(
+    tmp_path: Path, section: str
+) -> None:
+    report = GATED_REPORT.replace(
+        f"## {section}\n",
+        f"## {section}\n\n门禁事项不得重复：{PR_2}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_confirmed_contribution_gate_item_cannot_leak_into_one_engineer_answer(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "结论：",
+        f"结论：{PR_2} 不得在这里出现；",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_encoded_contribution_gate_link_cannot_bypass_quarantine(tmp_path: Path) -> None:
+    encoded = (
+        "[Project-HAMi/HAMi&num;2]"
+        "(https://github.com/Project-HAMi/HAMi/pull/%32)"
+    )
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n门禁事项不得重复：{encoded}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "canonical [Project-HAMi/REPO#NUMBER](GitHub URL) form" in result.stderr
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_case_variant_contribution_gate_link_cannot_bypass_quarantine(
+    tmp_path: Path,
+) -> None:
+    variant = (
+        "[project-hami/hami#2]"
+        "(http://github.com/project-hami/hami/pull/2)"
+    )
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n门禁事项不得重复：{variant}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "canonical [Project-HAMi/REPO#NUMBER](GitHub URL) form" in result.stderr
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "/Project-HAMi/HAMi/pull/2",
+        "/x/../Project-HAMi/HAMi/pull/2",
+        "/%2e%2e/Project-HAMi/HAMi/pull/2",
+        "/foo/%2e%2e/Project-HAMi/HAMi/pull/2",
+        "//github.com/Project-HAMi/HAMi/pull/2",
+        "https://www.github.com/Project-HAMi/HAMi/pull/2",
+        "https:///github.com/Project-HAMi/HAMi/pull/2",
+        "https://github.com.:443/Project-HAMi/HAMi/pull/2",
+        r"https:\github.com\Project-HAMi\HAMi\pull\2",
+        "https://github.com/Project-HAMi/HAMi/x/../pull/2",
+        "https://github.com/Project-HAMi/x/../HAMi/pull/2",
+        "https://github.com/Project-HAMi/HAMi/%2e%2e/HAMi/pull/2",
+        "https://github.com//Project-HAMi//HAMi//pull//2",
+        "https://github。com/Project-HAMi/HAMi/pull/2",
+    ),
+)
+def test_alternate_github_url_forms_cannot_bypass_quarantine(
+    tmp_path: Path, url: str
+) -> None:
+    variant = f"[same PR]({url})"
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n门禁事项不得重复：{variant}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "canonical [Project-HAMi/REPO#NUMBER](GitHub URL) form" in result.stderr
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_contribution_gate_entry_cannot_reference_another_item(tmp_path: Path) -> None:
+    report = GATED_REPORT.replace(
+        f"   - 相关事项：{PR_2}",
+        f"   - 相关事项：{PR_2}、{ISSUE_1}",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "must not reference other items" in result.stderr
+
+
+def test_encoded_other_item_cannot_hide_inside_contribution_gate_entry(tmp_path: Path) -> None:
+    encoded = (
+        "[Project-HAMi/HAMi&num;1]"
+        "(https://github.com/Project-HAMi/HAMi/issues/%31)"
+    )
+    report = GATED_REPORT.replace(
+        f"   - 相关事项：{PR_2}",
+        f"   - 相关事项：{PR_2}、{encoded}",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "must not reference other items" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("replacement", "message"),
+    (
+        ("`unknown-gate`", "unsupported IDs"),
+        (
+            "`review-replies`、`author-understanding`",
+            "must follow the Contribution Gates policy order",
+        ),
+        ("`review-replies`、`review-replies`", "must not contain duplicate IDs"),
+        (
+            "hardware-validation、`review-replies`",
+            "must contain only backticked Contribution Gate IDs separated by 、",
+        ),
+    ),
+)
+def test_contribution_gate_ids_are_allowlisted_unique_and_policy_ordered(
+    tmp_path: Path, replacement: str, message: str
+) -> None:
+    report = GATED_REPORT.replace("`review-replies`", replacement, 1)
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_contribution_gate_ids_accept_multiple_values_in_policy_order(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "`review-replies`",
+        "`author-understanding`、`review-replies`",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_contribution_gate_scope_note_stays_synchronized_with_skill() -> None:
+    assert GATE_SCOPE_NOTE == VALIDATOR_MODULE.CONTRIBUTION_GATE_SCOPE_NOTE
+    assert SKILL.read_text(encoding="utf-8").count(GATE_SCOPE_NOTE) == 2
+
+
+def test_contribution_gate_section_requires_scope_note_and_gate_fields(tmp_path: Path) -> None:
+    missing_scope = _run(tmp_path, GATED_REPORT.replace(GATE_SCOPE_NOTE, "范围：候选事项。", 1))
+    missing_field = _run(
+        tmp_path,
+        GATED_REPORT.replace("   - 恢复条件：作者针对该意见给出本人编写且可验证的技术回复。\n", "", 1),
+    )
+
+    assert missing_scope.returncode != 0
+    assert "exact candidate-pool scope note once" in missing_scope.stderr
+    assert missing_field.returncode != 0
+    assert "恢复条件" in missing_field.stderr
+
+
+def test_contribution_gate_section_rejects_duplicate_basis_field(tmp_path: Path) -> None:
+    report = GATED_REPORT.replace(
+        "   - 恢复条件：",
+        "   - 门禁判定依据：另一条更强的未审计指控。\n   - 恢复条件：",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "exactly one of each gate field" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "encoded_field",
+    (
+        "   - 未满足的门禁&#58; `hardware-validation`",
+        "   - 门禁判定依据&colon; 未经审计的更严重指控。",
+        "   - 恢复条件&#xFF1A; 无。",
+    ),
+)
+def test_contribution_gate_section_rejects_html_encoded_reserved_fields(
+    tmp_path: Path, encoded_field: str
+) -> None:
+    report = GATED_REPORT.replace(
+        "   - 恢复条件：",
+        f"{encoded_field}\n   - 恢复条件：",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "must use literal canonical field lines" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "smuggled_field",
+    (
+        "未满足的门禁：`hardware-validation`",
+        "> 未满足的门禁：`hardware-validation`",
+        "**未满足的门禁**：`hardware-validation`",
+        "未满足的**门禁**：`hardware-validation`",
+        "未满足的`门禁`：`hardware-validation`",
+        "门禁判定**依据**：未经审计的指控。",
+        "恢**复**条件：无。",
+        "> 未满足的**门禁**&#58; `hardware-validation`",
+        "<span>门禁判定依据</span>：未经审计的指控。",
+        "未满足<!-- -->的门禁：`hardware-validation`",
+        "未满足的[门禁][gate]：`hardware-validation`\n[gate]: https://example.com",
+    ),
+)
+def test_contribution_gate_section_rejects_noncanonical_rendered_gate_fields(
+    tmp_path: Path, smuggled_field: str
+) -> None:
+    report = GATED_REPORT.replace(
+        "   - 恢复条件：",
+        f"{smuggled_field}\n   - 恢复条件：",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert (
+        "must use literal canonical field lines" in result.stderr
+        or "raw HTML is not allowed" in result.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_link",
+    (
+        '<a href="https://github.com/Project-HAMi/HAMi/pull/2">same PR</a>',
+        '<a href="//github.com/Project-HAMi/HAMi/pull/2">same PR</a>',
+        '<a href="https://github.com/Project-\tHAMi/HAMi/pull/2">same PR</a>',
+    ),
+)
+def test_raw_html_links_cannot_bypass_contribution_gate_quarantine(
+    tmp_path: Path, raw_link: str
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n门禁事项不得重复：{raw_link}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "GitHub item URLs require the canonical" in result.stderr
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "raw_html",
+    (
+        "Project-<span>HAMi</span>/HAMi#2",
+        "<!-- hide the remainder of the report",
+        "<details>\n<summary>collapsed contribution</summary>",
+        "<?",
+        "<!DOCTYPE",
+        "<![CDATA[",
+        "<details",
+        "<script",
+    ),
+)
+def test_raw_html_is_rejected_anywhere_in_visible_report(
+    tmp_path: Path, raw_html: str
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n{raw_html}\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "raw HTML is not allowed in the report" in result.stderr
+
+
+def test_reference_style_link_cannot_bypass_contribution_gate_quarantine(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        "## Executive Summary\n\n门禁事项不得重复：[Project-HAMi][org]/HAMi#2\n"
+        "[org]: https://example.com\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "reference-style Markdown links are not allowed" in result.stderr
+
+
+def test_fenced_reference_cannot_bypass_contribution_gate_quarantine(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        "## Executive Summary\n\n```markdown\n"
+        f"{PR_2}\n"
+        "```\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_fenced_plain_label_cannot_bypass_contribution_gate_quarantine(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        "## Executive Summary\n\n```text\nProject-HAMi/HAMi#2\n```\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_contribution_gate_section_rejects_fenced_duplicate_gate_field(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "   - 恢复条件：",
+        "```text\n未满足的门禁：`hardware-validation`\n```\n"
+        "   - 恢复条件：",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "must not contain fenced code blocks" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "smuggled_field",
+    (
+        "未满足的门禁：`hardware-validation`",
+        "> 门禁判定依据：未经审计。",
+    ),
+)
+def test_contribution_gate_section_rejects_gate_fields_before_first_entry(
+    tmp_path: Path, smuggled_field: str
+) -> None:
+    report = GATED_REPORT.replace(
+        f"{GATE_SCOPE_NOTE}\n\n",
+        f"{GATE_SCOPE_NOTE}\n\n{smuggled_field}\n\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "only allowed as canonical fields inside an entry" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "plain_reference",
+    (
+        "github.com/Project-HAMi/HAMi/pull/2",
+        "www.github.com/Project-HAMi/HAMi/pull/2",
+        "Project-HAMi/HAMi/pull/2",
+    ),
+)
+def test_plain_path_references_cannot_bypass_contribution_gate_quarantine(
+    tmp_path: Path, plain_reference: str
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n门禁事项不得重复：{plain_reference}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "GitHub item URLs require the canonical" in result.stderr
+    assert "Contribution Gate item must not appear outside" in result.stderr
+
+
+def test_bare_hash_reference_is_rejected_instead_of_bypassing_quarantine(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        "## Executive Summary\n\n门禁事项不得重复：PR #2。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "unlinked issue or pull request reference" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "rendered_reference",
+    (
+        "Project-HAMi/HAMi#\u200b2",
+        "Project-**HAMi**/HAMi#2",
+    ),
+)
+def test_rendered_plain_references_cannot_bypass_quarantine(
+    tmp_path: Path, rendered_reference: str
+) -> None:
+    report = GATED_REPORT.replace(
+        "## Executive Summary\n",
+        f"## Executive Summary\n\n门禁事项不得重复：{rendered_reference}。\n",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "unlinked issue or pull request reference" in result.stderr
+
+
+def test_contribution_gate_section_rejects_empty_marker_with_entries(
+    tmp_path: Path,
+) -> None:
+    report = GATED_REPORT.replace(
+        GATE_SCOPE_NOTE,
+        f"{GATE_SCOPE_NOTE}\n\n本周未发现。",
+        1,
+    )
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "must not claim 本周未发现 when entries exist" in result.stderr
+
+
+def test_contribution_gate_section_is_required(tmp_path: Path) -> None:
+    report = VALID_REPORT.split("## Active Contributions Not Meeting Contribution Gates", 1)[0]
+
+    result = _run(tmp_path, report)
+
+    assert result.returncode != 0
+    assert "required report sections must appear exactly once" in result.stderr

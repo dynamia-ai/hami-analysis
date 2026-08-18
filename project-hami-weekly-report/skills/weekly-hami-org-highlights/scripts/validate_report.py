@@ -6,10 +6,14 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import hashlib
+import html
 import json
 from pathlib import Path
+import posixpath
 import re
 import sys
+import unicodedata
+from urllib.parse import unquote, urlsplit
 
 
 REPORT_TITLE = "# Weekly HAMi Org Highlights"
@@ -22,10 +26,11 @@ ANALYTIC_SECTION_ORDER = (
     "Emerging Engineering Themes",
     "Recommended Resource Allocation",
     "Active but Not Worth Investing This Week",
+    "Active Contributions Not Meeting Contribution Gates",
 )
 ANALYTIC_SECTIONS = set(ANALYTIC_SECTION_ORDER)
 ONE_ENGINEER_HEADING = "### One engineer-week priority"
-SECTION_MAX_ITEMS = {
+SECTION_MAX_ITEMS: dict[str, int | None] = {
     "Executive Summary": 6,
     "Must Pay Attention": 5,
     "Worth Engineering Investment": 8,
@@ -34,6 +39,7 @@ SECTION_MAX_ITEMS = {
     "Emerging Engineering Themes": 5,
     "Recommended Resource Allocation": 5,
     "Active but Not Worth Investing This Week": 8,
+    "Active Contributions Not Meeting Contribution Gates": None,
 }
 PR_CATEGORIES = {
     "Review now",
@@ -61,7 +67,29 @@ SECTION_REQUIRED_FIELDS = {
     "Emerging Engineering Themes": {"规划意义", "置信度", "建议投入类型"},
     "Recommended Resource Allocation": {"工程主题", "推荐动作", "投入规模", "预期结果", "延迟处理风险"},
     "Active but Not Worth Investing This Week": {"暂不投入原因", "建议投入类型"},
+    "Active Contributions Not Meeting Contribution Gates": {
+        "未满足的门禁",
+        "门禁判定依据",
+        "恢复条件",
+        "建议投入类型",
+    },
 }
+
+CONTRIBUTION_GATE_SECTION = "Active Contributions Not Meeting Contribution Gates"
+CONTRIBUTION_GATE_SCOPE_NOTE = (
+    "范围：覆盖本周期 evidence 中全部活跃 PR；“活跃”指采集周期内存在活动，"
+    "包含当前已关闭或已合并事项。普通 Issue 不适用当前六项门禁。"
+    "`no_confirmed_violation` 与 `insufficient_evidence` 均不代表门禁已通过。"
+)
+CONTRIBUTION_GATE_IDS = (
+    "author-understanding",
+    "hardware-validation",
+    "scope-and-commit-messages",
+    "review-replies",
+    "commit-trailer-hygiene",
+    "ai-generated-review-comments",
+)
+CONTRIBUTION_GATE_ID_SET = set(CONTRIBUTION_GATE_IDS)
 
 INVESTMENT_SCALES = {
     "quick review",
@@ -76,9 +104,22 @@ GITHUB_ITEM_URL_RE = re.compile(
     r"https://github\.com/Project-HAMi/(?P<repo>[A-Za-z0-9_.-]+)/"
     r"(?P<kind>issues|pull)/(?P<number>\d+)"
 )
+GITHUB_URL_CANDIDATE_RE = re.compile(
+    r"(?:(?:https?:)?//)[^\s<>()\]\"']+", re.IGNORECASE
+)
+GITHUB_SCHEMELESS_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:"
+    r"(?:(?:www\.)?github\.com/)?"
+    r"Project-HAMi/[A-Za-z0-9_.-]+/(?:issues|pull)/\d+"
+    r")",
+    re.IGNORECASE,
+)
 GITHUB_ITEM_LINK_RE = re.compile(
     r"(?<!!)\[([^\]]+)\]\((https://github\.com/Project-HAMi/[A-Za-z0-9_.-]+/"
     r"(?:issues|pull)/\d+)\)"
+)
+MARKDOWN_LINK_RE = re.compile(
+    r"(?<!!)\[(?P<label>[^\]\r\n]+)\]\((?P<url>[^)\s\r\n]+)\)"
 )
 UNLINKED_REFERENCE_RE = re.compile(
     r"(?<![A-Za-z0-9_./])Project-HAMi/[A-Za-z0-9_.-]+#\d+"
@@ -93,6 +134,15 @@ INVESTMENT_LABEL_RE = re.compile(r"(?P<label>建议投入类型|建议投入|投
 INVESTMENT_VALUE_RE = re.compile(r"\s*`([^`\r\n]+)`")
 FENCE_OPEN_RE = re.compile(r"^[ ]{0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 FIELD_RE = re.compile(r"^   - (?P<name>[^：:]+)[：:](?P<value>.*)$")
+BACKTICK_TOKEN_RE = re.compile(r"`(?P<value>[^`\r\n]+)`")
+CONTRIBUTION_GATE_LIST_RE = re.compile(r"`[a-z0-9-]+`(?:、`[a-z0-9-]+`)*")
+RAW_HTML_RE = re.compile(
+    r"<!--|-->|<\?|\?>|<![A-Za-z]|<!\[CDATA\[|\]\]>|</?[A-Za-z][A-Za-z0-9-]*(?=[\s/>]|$)",
+    re.IGNORECASE,
+)
+INLINE_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\r\n]+)\]\([^)\s\r\n]+\)")
+REFERENCE_LINK_RE = re.compile(r"\[[^\]\r\n]+\][ \t]*\[[^\]\r\n]*\]")
+REFERENCE_LINK_DEFINITION_RE = re.compile(r"^[ ]{0,3}\[[^\]\r\n]+\]:")
 EVIDENCE_ITEM_RE = re.compile(
     r"^<!-- ITEM_START (?P<kind>issue|pull_request) (?P<id>[^\r\n]+) -->[ \t]*$", re.MULTILINE
 )
@@ -233,6 +283,20 @@ def _document_errors(lines: list[str], visible: list[bool]) -> list[str]:
         if line.startswith("## ") and not line.startswith("### ")
     )
     errors: list[str] = []
+    for line_number, (line, is_visible) in enumerate(
+        zip(lines, visible, strict=True), start=1
+    ):
+        if is_visible and RAW_HTML_RE.search(line):
+            errors.append(
+                f"line {line_number}: raw HTML is not allowed in the report"
+            )
+        if is_visible and (
+            REFERENCE_LINK_RE.search(line)
+            or REFERENCE_LINK_DEFINITION_RE.search(line)
+        ):
+            errors.append(
+                f"line {line_number}: reference-style Markdown links are not allowed in the report"
+            )
     if first_nonempty != REPORT_TITLE:
         errors.append(f"required report title is {REPORT_TITLE!r}")
     if headings != ANALYTIC_SECTION_ORDER:
@@ -243,18 +307,107 @@ def _document_errors(lines: list[str], visible: list[bool]) -> list[str]:
     return errors
 
 
+def _decode_reference(value: str) -> str:
+    """Decode common rendered-link equivalents before enforcing canonical syntax."""
+    decoded = value
+    for _ in range(3):
+        candidate = unquote(html.unescape(decoded))
+        if candidate == decoded:
+            break
+        decoded = candidate
+    return decoded
+
+
+def _semantic_reference(value: str) -> str:
+    """Normalize browser-equivalent separators for identity and quarantine checks."""
+    normalized = re.sub(r"[\t\r\n]", "", _decode_reference(value)).translate(
+        str.maketrans({"\\": "/", "。": ".", "．": ".", "｡": "."})
+    )
+    return re.sub(
+        r"\A(?P<scheme>https?):/+",
+        r"\g<scheme>://",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+
+def _rendered_gate_text(value: str) -> str:
+    """Approximate visible inline Markdown before checking reserved field labels."""
+    rendered = html.unescape(value)
+    for _ in range(3):
+        candidate = INLINE_MARKDOWN_LINK_RE.sub(r"\1", rendered)
+        if candidate == rendered:
+            break
+        rendered = candidate
+    rendered = "".join(
+        character
+        for character in rendered
+        if unicodedata.category(character) not in {"Cf", "Mn"}
+    )
+    return rendered.translate(str.maketrans("", "", "*_~`\\[]"))
+
+
+def _semantic_github_item(value: str) -> tuple[str, str, int] | None:
+    """Resolve browser-equivalent GitHub URLs to one case-insensitive item identity."""
+    normalized = _semantic_reference(value).rstrip(".,;:!?，。；：！？、")
+    if re.match(r"(?:www\.)?github\.com/", normalized, re.IGNORECASE):
+        normalized = "https://" + normalized
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return None
+    if not parsed.scheme and not parsed.netloc:
+        relative_path = posixpath.normpath("/" + parsed.path.lstrip("/"))
+        if re.match(r"/Project-HAMi/", relative_path, re.IGNORECASE):
+            normalized = "https://github.com" + relative_path
+            parsed = urlsplit(normalized)
+    if parsed.scheme.casefold() not in {"", "http", "https"}:
+        return None
+    try:
+        host = (parsed.hostname or "").encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    host = host.rstrip(".").casefold()
+    if host not in {"github.com", "www.github.com"}:
+        return None
+    path = posixpath.normpath("/" + parsed.path.lstrip("/"))
+    match = re.fullmatch(
+        r"/project-hami/(?P<repo>[A-Za-z0-9_.-]+)/(?P<kind>issues|pull)/(?P<number>\d+)",
+        path,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return (
+        match.group("repo").casefold(),
+        match.group("kind").casefold(),
+        int(match.group("number")),
+    )
+
+
 def _link_errors(lines: list[str], visible: list[bool]) -> list[str]:
     errors: list[str] = []
     for line_number, line in enumerate(lines, start=1):
         if not visible[line_number - 1]:
             continue
         remaining = line
-        for match in reversed(list(GITHUB_ITEM_LINK_RE.finditer(line))):
-            label = match.group(1)
-            url = match.group(2)
+        for match in reversed(list(MARKDOWN_LINK_RE.finditer(line))):
+            raw_label = match.group("label")
+            raw_url = match.group("url")
+            label = _decode_reference(raw_label)
+            url = _semantic_reference(raw_url)
             label_match = CANONICAL_LABEL_RE.fullmatch(label)
+            semantic_item = _semantic_github_item(url)
+            if semantic_item is None:
+                continue
             url_match = GITHUB_ITEM_URL_RE.fullmatch(url)
-            if label_match is None or url_match is None:
+            if (
+                label_match is None
+                or url_match is None
+                or label != raw_label
+                or url != raw_url
+                or GITHUB_ITEM_LINK_RE.fullmatch(match.group(0)) is None
+            ):
                 errors.append(
                     f"line {line_number}: issue or pull request links must use the canonical "
                     "[Project-HAMi/REPO#NUMBER](GitHub URL) form"
@@ -268,13 +421,14 @@ def _link_errors(lines: list[str], visible: list[bool]) -> list[str]:
                 )
             remaining = remaining[: match.start()] + remaining[match.end() :]
 
-        bare_url = GITHUB_ITEM_URL_RE.search(remaining)
+        decoded_remaining = _rendered_gate_text(_semantic_reference(remaining))
+        bare_url = bool(_semantic_item_ids_from_text(decoded_remaining))
         if bare_url:
             errors.append(
                 f"line {line_number}: GitHub item URLs require the canonical "
                 "[Project-HAMi/REPO#NUMBER](GitHub URL) form"
             )
-        unlinked = UNLINKED_REFERENCE_RE.search(remaining)
+        unlinked = UNLINKED_REFERENCE_RE.search(decoded_remaining)
         if unlinked:
             errors.append(
                 f"line {line_number}: unlinked issue or pull request reference "
@@ -719,8 +873,9 @@ def _contract_errors(
     bounds = _section_bounds(lines, visible)
     for section, (start, end) in bounds.items():
         entries = _entry_ranges(lines, visible, start, end)
-        if len(entries) > SECTION_MAX_ITEMS[section]:
-            errors.append(f"section {section!r}: allows at most {SECTION_MAX_ITEMS[section]} items")
+        maximum = SECTION_MAX_ITEMS[section]
+        if maximum is not None and len(entries) > maximum:
+            errors.append(f"section {section!r}: allows at most {maximum} items")
         if section == "Pull Requests Requiring Action":
             headings = [
                 lines[index].rstrip("\r\n")[4:]
@@ -791,6 +946,205 @@ def _contract_errors(
     return errors
 
 
+def _semantic_item_ids_from_text(value: str) -> set[str]:
+    item_ids: set[str] = set()
+    normalized = _semantic_reference(_rendered_gate_text(value))
+    candidates = [
+        *(match.group(0) for match in GITHUB_URL_CANDIDATE_RE.finditer(normalized)),
+        *(
+            match.group(0)
+            for match in GITHUB_SCHEMELESS_CANDIDATE_RE.finditer(normalized)
+        ),
+    ]
+    for candidate in candidates:
+        item = _semantic_github_item(candidate)
+        if item is not None:
+            repo, _, number = item
+            item_ids.add(f"project-hami/{repo}#{number}")
+    return item_ids
+
+
+def _linked_item_ids(value: str) -> set[str]:
+    item_ids = _semantic_item_ids_from_text(value)
+    rendered = _rendered_gate_text(value)
+    for match in re.finditer(
+        r"Project-HAMi/(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>\d+)",
+        rendered,
+        re.IGNORECASE,
+    ):
+        item_ids.add(
+            f"project-hami/{match.group('repo').casefold()}#{int(match.group('number'))}"
+        )
+    for link in MARKDOWN_LINK_RE.finditer(value):
+        item = _semantic_github_item(link.group("url"))
+        if item is not None:
+            repo, _, number = item
+            item_ids.add(f"project-hami/{repo}#{number}")
+    return item_ids
+
+
+def _contribution_gate_errors(lines: list[str], visible: list[bool]) -> list[str]:
+    """Validate the quarantined section's scope, entries, and cross-section isolation."""
+    errors: list[str] = []
+    bounds = _section_bounds(lines, visible)
+    section_bounds = bounds.get(CONTRIBUTION_GATE_SECTION)
+    if section_bounds is None:
+        return errors
+    start, end = section_bounds
+    entries = _entry_ranges(lines, visible, start, end)
+    if any(not visible[index] for index in range(start + 1, end)):
+        errors.append(
+            f"section {CONTRIBUTION_GATE_SECTION!r} must not contain fenced code blocks"
+        )
+    scope_note_lines = [
+        index
+        for index in range(start + 1, end)
+        if visible[index] and lines[index].rstrip("\r\n") == CONTRIBUTION_GATE_SCOPE_NOTE
+    ]
+    if len(scope_note_lines) != 1:
+        errors.append(
+            f"section {CONTRIBUTION_GATE_SECTION!r} must contain the exact candidate-pool scope note once"
+        )
+    empty_markers = [
+        index
+        for index in range(start + 1, end)
+        if visible[index] and lines[index].rstrip("\r\n") == "本周未发现。"
+    ]
+    if entries and empty_markers:
+        errors.append(
+            f"section {CONTRIBUTION_GATE_SECTION!r} must not claim 本周未发现 when entries exist"
+        )
+    if not entries and len(empty_markers) != 1:
+        errors.append(
+            f"empty section {CONTRIBUTION_GATE_SECTION!r} must contain exactly one 本周未发现。 marker"
+        )
+
+    entry_line_indexes = {
+        index
+        for entry_start, entry_end in entries
+        for index in range(entry_start, entry_end)
+    }
+    reserved_gate_fields = {"未满足的门禁", "门禁判定依据", "恢复条件"}
+    for index in range(start + 1, end):
+        if index in entry_line_indexes or not visible[index]:
+            continue
+        rendered_line = _rendered_gate_text(lines[index])
+        if any(name in rendered_line for name in reserved_gate_fields):
+            errors.append(
+                f"line {index + 1}: Contribution Gate fields are only allowed as "
+                "canonical fields inside an entry"
+            )
+
+    quarantined_ids: set[str] = set()
+    for entry_start, entry_end in entries:
+        title_ids = _linked_item_ids(lines[entry_start])
+        if len(title_ids) != 1:
+            errors.append(
+                f"line {entry_start + 1}: {CONTRIBUTION_GATE_SECTION} entries require exactly one item link in the title"
+            )
+            continue
+        item_id = next(iter(title_ids))
+        if item_id in quarantined_ids:
+            errors.append(
+                f"line {entry_start + 1}: {item_id} appears in more than one {CONTRIBUTION_GATE_SECTION} entry"
+            )
+        quarantined_ids.add(item_id)
+
+        entry_ids: set[str] = set()
+        field_values: dict[str, str] = {}
+        gate_field_counts = {
+            "未满足的门禁": 0,
+            "门禁判定依据": 0,
+            "恢复条件": 0,
+        }
+        for index in range(entry_start, entry_end):
+            line = lines[index].rstrip("\r\n")
+            entry_ids.update(_linked_item_ids(line))
+            if not visible[index]:
+                continue
+            if RAW_HTML_RE.search(line):
+                errors.append(
+                    f"line {index + 1}: raw HTML is not allowed in Contribution Gate entries"
+                )
+            decoded_line = html.unescape(line)
+            rendered_line = _rendered_gate_text(line)
+            canonical_field = FIELD_RE.fullmatch(line)
+            canonical_name = (
+                canonical_field.group("name").strip()
+                if canonical_field is not None
+                else None
+            )
+            reserved_mentions = [
+                name
+                for name in gate_field_counts
+                for _ in range(rendered_line.count(name))
+            ]
+            if reserved_mentions and (
+                decoded_line != line
+                or len(reserved_mentions) != 1
+                or canonical_name != reserved_mentions[0]
+            ):
+                errors.append(
+                    f"line {index + 1}: Contribution Gate fields must use literal canonical "
+                    "field lines and must not be repeated in rendered prose"
+                )
+            if canonical_field is not None:
+                match = canonical_field
+                name = match.group("name").strip()
+                field_values[name] = match.group("value").strip()
+                if name in gate_field_counts:
+                    gate_field_counts[name] += 1
+        duplicates = sorted(name for name, count in gate_field_counts.items() if count != 1)
+        if duplicates:
+            errors.append(
+                f"line {entry_start + 1}: {CONTRIBUTION_GATE_SECTION} entries require exactly "
+                "one of each gate field: " + ", ".join(duplicates)
+            )
+        unexpected_ids = sorted(entry_ids - {item_id})
+        if unexpected_ids:
+            errors.append(
+                f"line {entry_start + 1}: {CONTRIBUTION_GATE_SECTION} entry for {item_id} "
+                "must not reference other items: " + ", ".join(unexpected_ids)
+            )
+
+        gate_value = field_values.get("未满足的门禁", "")
+        gate_tokens = (
+            [match.group("value") for match in BACKTICK_TOKEN_RE.finditer(gate_value)]
+            if CONTRIBUTION_GATE_LIST_RE.fullmatch(gate_value)
+            else []
+        )
+        invalid = sorted(set(gate_tokens) - CONTRIBUTION_GATE_ID_SET)
+        if not gate_tokens:
+            errors.append(
+                f"line {entry_start + 1}: 未满足的门禁 must contain only backticked "
+                "Contribution Gate IDs separated by 、"
+            )
+        if invalid:
+            errors.append(
+                f"line {entry_start + 1}: 未满足的门禁 contains unsupported IDs: "
+                + ", ".join(invalid)
+            )
+        if len(gate_tokens) != len(set(gate_tokens)):
+            errors.append(f"line {entry_start + 1}: 未满足的门禁 must not contain duplicate IDs")
+        policy_order = [gate for gate in CONTRIBUTION_GATE_IDS if gate in gate_tokens]
+        if not invalid and gate_tokens != policy_order:
+            errors.append(
+                f"line {entry_start + 1}: 未满足的门禁 must follow the Contribution Gates policy order"
+            )
+
+    if quarantined_ids:
+        for index, line in enumerate(lines):
+            if start <= index < end:
+                continue
+            leaked = sorted(_linked_item_ids(line) & quarantined_ids)
+            if leaked:
+                errors.append(
+                    f"line {index + 1}: Contribution Gate item must not appear outside "
+                    f"{CONTRIBUTION_GATE_SECTION}: " + ", ".join(leaked)
+                )
+    return errors
+
+
 def validate_report(content: str, evidence: str | None = None) -> list[str]:
     lines = content.splitlines(keepends=True)
     visible, fence_errors = _visible_lines(lines)
@@ -803,6 +1157,7 @@ def validate_report(content: str, evidence: str | None = None) -> list[str]:
         + _one_engineer_errors(lines, visible)
         + _investment_errors(lines, visible)
         + _contract_errors(lines, visible, _evidence_items(evidence) if evidence is not None else {})
+        + _contribution_gate_errors(lines, visible)
     )
 
 
