@@ -1,0 +1,18 @@
+github:
+  token_env: PUBLIC_GITHUB_TOKEN
+  api_version: "2026-03-10"
+period:
+  timezone: Asia/Shanghai
+members:
+  - member_id: fixture-member
+    github_login: fixture-login
+    github_node_id: U_fixture
+    active_from: 2027-01-01
+    active_until: null
+repository_policy:
+  public_only: true
+  first_party_owners: [dynamia-ai]
+  excluded_owner_ids: []
+  excluded_repo_ids: []
+output:
+  directory: ./output

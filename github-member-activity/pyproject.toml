@@ -1,0 +1,29 @@
+[project]
+name = "github-member-activity"
+version = "1.0.0"
+description = "Deterministic public GitHub participation metrics for configured members."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+  "httpx>=0.28.1,<1",
+  "pydantic>=2.12.5,<3",
+  "pyyaml>=6.0.3,<7",
+  "typer>=0.21.0,<1",
+]
+
+[project.scripts]
+github-member-activity = "github_member_activity.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=9.0.2,<10"]
+
+[build-system]
+requires = ["hatchling>=1.28"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/github_member_activity"]

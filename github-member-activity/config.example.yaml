@@ -1,0 +1,18 @@
+github:
+  token_env: PUBLIC_GITHUB_TOKEN
+  api_version: "2026-03-10"
+period:
+  timezone: Asia/Shanghai
+members:
+  - member_id: example-member
+    github_login: example-login
+    github_node_id: U_example
+    active_from: 2026-01-01
+    active_until: null
+repository_policy:
+  public_only: true
+  first_party_owners: [dynamia-ai, Project-HAMi]
+  excluded_owner_ids: []
+  excluded_repo_ids: []
+output:
+  directory: ./output
