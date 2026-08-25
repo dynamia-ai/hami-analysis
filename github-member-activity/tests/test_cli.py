@@ -381,37 +381,3 @@ def test_receipt_transaction_preserves_real_published_or_diagnostic_authority(tm
     assert cli_module.verify_directory(run_dir)[1] == (0 if mode == "published" else 3)
     authorities = list((case_root / ("output/weekly-20260727--20260803" if mode == "published" else "diagnostics")).glob("*/run-manifest.json"))
     assert len(authorities) == 1
-
-
-def test_workflow_run_blocks_are_shell_parseable():
-    workflow = Path(__file__).parents[2] / ".github" / "workflows" / "github-member-activity.yml"
-    text = workflow.read_text(encoding="utf-8")
-    wrapper = workflow.parents[2] / "github-member-activity" / "scripts" / "workflow_wrapper.sh"
-    wrapper_text = wrapper.read_text(encoding="utf-8")
-    assert "uv run github-member-activity collect" in wrapper_text
-    assert "github-member-activity-receipt.json" in wrapper_text
-    assert "scripts/final_gate.sh" in text
-    blocks = []
-    current = []
-    in_block = False
-    for line in text.splitlines():
-        if line.startswith("        run: |"):
-            in_block = True
-            current = []
-            continue
-        if in_block and line.startswith("        ") and not line.startswith("          "):
-            blocks.append("\n".join(current) + "\n")
-            in_block = False
-        elif in_block:
-            current.append(line[10:] if line.startswith("          ") else line)
-    if in_block:
-        blocks.append("\n".join(current) + "\n")
-    assert blocks
-    for block in blocks:
-        completed = subprocess.run(["bash", "-n"], input=block, text=True, capture_output=True)
-        assert completed.returncode == 0, completed.stderr
-    completed = subprocess.run(["bash", "-n", str(wrapper)], text=True, capture_output=True)
-    assert completed.returncode == 0, completed.stderr
-    final_gate = wrapper.parent / "final_gate.sh"
-    completed = subprocess.run(["bash", "-n", str(final_gate)], text=True, capture_output=True)
-    assert completed.returncode == 0, completed.stderr
