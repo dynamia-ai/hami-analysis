@@ -105,6 +105,20 @@ def _ordered_node_map(nodes: Any, ids: list[str]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _query_nodes(client: GitHubClient, query: str, ids: list[str]) -> dict[str, Any]:
+    """Bound nodes(ids:) requests without weakening caller-side identity gates."""
+    if len(ids) <= 100:
+        return client.graphql(query, {"ids": ids})
+    nodes: list[dict[str, Any]] = []
+    for offset in range(0, len(ids), 100):
+        batch = ids[offset:offset + 100]
+        response = client.graphql(query, {"ids": batch})
+        # A missing/extra/reordered node must not be hidden by another batch.
+        by_id = _ordered_node_map(response.get("nodes") if isinstance(response, dict) else None, batch)
+        nodes.extend(by_id.values())
+    return {"nodes": nodes}
+
+
 def _commit_group_pages(client: GitHubClient, login: str, start_day, end_day) -> tuple[list[dict[str, Any]], bool]:
     variables = {"login": login, "from": f"{start_day.isoformat()}T00:00:00Z", "to": f"{end_day.isoformat()}T23:59:59Z"}
 
@@ -266,7 +280,7 @@ def _commit_snapshot(client: GitHubClient, login: str, member_node_id: str, star
     public_repo_ids = list(dict.fromkeys(row["repo_id"] for row in result))
     if not public_repo_ids:
         return []
-    hydrated_data = client.graphql(COMMIT_REPOSITORY_HYDRATION_QUERY, {"ids": public_repo_ids})
+    hydrated_data = _query_nodes(client, COMMIT_REPOSITORY_HYDRATION_QUERY, public_repo_ids)
     hydrated = hydrated_data.get("nodes") if isinstance(hydrated_data, dict) else None
     if not isinstance(hydrated, list) or len(hydrated) != len(public_repo_ids):
         raise RuntimeError("visibility_unverified")
@@ -483,7 +497,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         candidate_rows: dict[str, tuple[str, str, list[Any]]] = {}
         for source, base, kind, time_field in source_specs:
             try:
-                candidates = stable_search(client, base, start, end)
+                # REST created_at can differ from GraphQL createdAt by one second.
+                # Discover a boundary envelope; canonical event filtering below
+                # still enforces the original half-open member window.
+                search_start = start - timedelta(seconds=1) if time_field == "createdAt" else start
+                search_end = end + timedelta(seconds=1) if time_field == "createdAt" else end
+                candidates = stable_search(client, base, search_start, search_end)
                 search_proofs[(member.member_id, source)] = format_z(datetime.now(UTC).replace(microsecond=0))
                 if any(candidate.actor_node_id != member.github_node_id for candidate in candidates):
                     set_status(member.member_id, source, "failed", "search_candidate_conflict", proof_override=(True, True, False, None))
@@ -502,7 +521,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             discovery_nodes: list[dict[str, Any]] = []
             for _ in range(2):
                 try:
-                    discovery_data = client.graphql(DISCOVERY_QUERY, {"ids": candidate_ids})
+                    discovery_data = _query_nodes(client, DISCOVERY_QUERY, candidate_ids)
                 except Exception as exc:
                     for source, _, _, _ in all_candidates:
                         set_status(member.member_id, source, "partial", _exception_reason(exc, "graphql_partial_response"), proof_override=(True, True, False, None))
@@ -519,7 +538,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     rest_ready = False
                     break
                 discovery_nodes = list(discovery_map.values())
-                discovery_snapshots.append(tuple(sorted((node.get("id"), node.get("__typename"), (node.get("author") or {}).get("id"), node.get("createdAt"), node.get("mergedAt"), (node.get("repository") or {}).get("id"), (node.get("repository") or {}).get("visibility"), ((node.get("repository") or {}).get("owner") or {}).get("id")) for node in discovery_nodes)))
+                discovery_snapshots.append(tuple(sorted((node.get("id"), node.get("__typename"), (node.get("author") or {}).get("id"), (node.get("author") or {}).get("__typename"), node.get("createdAt"), node.get("mergedAt"), (node.get("repository") or {}).get("id"), (node.get("repository") or {}).get("visibility"), ((node.get("repository") or {}).get("owner") or {}).get("id")) for node in discovery_nodes)))
             if rest_ready and (not discovery_snapshots or discovery_snapshots[0] != discovery_snapshots[1]):
                 for source, _, _, _ in all_candidates:
                     set_status(member.member_id, source, "partial", "graphql_snapshot_unstable", proof_override=(True, True, False, None))
@@ -535,7 +554,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             data = {"nodes": []}
             if rest_ready:
                 try:
-                    data = client.graphql(HYDRATE_QUERY, {"ids": candidate_ids})
+                    data = _query_nodes(client, HYDRATE_QUERY, candidate_ids)
                 except Exception as exc:
                     finished = datetime.now(UTC).replace(microsecond=0)
                     for source, _, _, _ in all_candidates:
@@ -564,6 +583,34 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         continue
                     author = node.get("author")
                     repo = node.get("repository")
+                    discovered_node = discovery_map[candidate.node_id]
+                    discovered_author = discovered_node.get("author")
+                    if (not isinstance(author, dict) or not isinstance(discovered_author, dict)
+                            or discovered_node.get("__typename") != expected_type
+                            or author != discovered_author
+                            or node.get("createdAt") != discovered_node.get("createdAt")
+                            or node.get("mergedAt") != discovered_node.get("mergedAt")):
+                        set_status(member.member_id, source, "failed", "graphql_snapshot_unstable")
+                        continue
+                    try:
+                        rest_created = parse_rfc3339(candidate.created_at)
+                        graphql_created = parse_rfc3339(node["createdAt"])
+                    except (ValueError, KeyError, TypeError):
+                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
+                        continue
+                    if abs(graphql_created - rest_created) > timedelta(seconds=1):
+                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
+                        continue
+                    # Search can attribute a Copilot-authored PR to the human
+                    # requester. A stable, public Bot node is not authored work.
+                    if (author.get("__typename") == "Bot" and isinstance(repo, dict)
+                            and repo.get("visibility") == "PUBLIC"
+                            and isinstance(repo.get("id"), str) and repo["id"]
+                            and isinstance((repo.get("owner") or {}).get("id"), str)
+                            and repo["owner"]["id"]
+                            and repo.get("id") == (discovered_node.get("repository") or {}).get("id")
+                            and (repo.get("owner") or {}).get("id") == (discovered_node.get("repository") or {}).get("owner", {}).get("id")):
+                        continue
                     if not isinstance(author, dict) or author.get("id") != member.github_node_id or author.get("__typename") != "User" or not isinstance(repo, dict):
                         set_status(member.member_id, source, "failed", "api_contract_violation")
                         continue
@@ -582,14 +629,6 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         occurred = parse_rfc3339(raw_time)
                     except ValueError:
                         set_status(member.member_id, source, "failed", "api_contract_violation")
-                        continue
-                    try:
-                        parse_rfc3339(candidate.created_at)
-                    except ValueError:
-                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
-                        continue
-                    if node.get("createdAt") != candidate.created_at:
-                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
                         continue
                     if not (start.astimezone(UTC) <= occurred < end.astimezone(UTC)):
                         continue
@@ -629,7 +668,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         continue
                     eligible.append({"id": row["id"], "issue_id": issue.get("id"), "created": created})
                 comment_ids = list(dict.fromkeys(item["id"] for item in eligible))
-                discovered_data = client.graphql(ISSUE_COMMENT_DISCOVERY_QUERY, {"ids": comment_ids}) if comment_ids else {"nodes": []}
+                discovered_data = _query_nodes(client, ISSUE_COMMENT_DISCOVERY_QUERY, comment_ids) if comment_ids else {"nodes": []}
                 discovered = discovered_data.get("nodes") if isinstance(discovered_data, dict) else None
                 if not isinstance(discovered, list) or len(discovered) != len(comment_ids):
                     raise RuntimeError("visibility_unverified")
@@ -644,7 +683,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if comment_repo.get("visibility") == "PUBLIC":
                         public_eligible.append(item)
                 issue_ids = list(dict.fromkeys(item["issue_id"] for item in public_eligible))
-                issue_discovery_data = client.graphql(ISSUE_COMMENT_ISSUE_DISCOVERY_QUERY, {"ids": issue_ids}) if issue_ids else {"nodes": []}
+                issue_discovery_data = _query_nodes(client, ISSUE_COMMENT_ISSUE_DISCOVERY_QUERY, issue_ids) if issue_ids else {"nodes": []}
                 issue_discovery_nodes = issue_discovery_data.get("nodes") if isinstance(issue_discovery_data, dict) else None
                 if not isinstance(issue_discovery_nodes, list) or len(issue_discovery_nodes) != len(issue_ids):
                     raise RuntimeError("visibility_unverified")
@@ -658,7 +697,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if repo.get("visibility") == "PUBLIC":
                         public_issue_ids.append(issue_id)
                 public_eligible = [item for item in public_eligible if item["issue_id"] in set(public_issue_ids)]
-                hydrated_data = client.graphql(ISSUE_COMMENT_HYDRATION_QUERY, {"ids": public_issue_ids}) if public_issue_ids else {"nodes": []}
+                hydrated_data = _query_nodes(client, ISSUE_COMMENT_HYDRATION_QUERY, public_issue_ids) if public_issue_ids else {"nodes": []}
                 hydrated = hydrated_data.get("nodes") if isinstance(hydrated_data, dict) else None
                 if not isinstance(hydrated, list) or len(hydrated) != len(public_issue_ids):
                     raise RuntimeError("visibility_unverified")
@@ -700,12 +739,15 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         review_snapshot_at: datetime | None = None
         try:
             review_snapshots: list[tuple[tuple[str, str, str], ...]] = []
+            candidate_snapshots: list[tuple[tuple[str, str, str, str], ...]] = []
             representative_rows: list[tuple[str, dict[str, Any]]] = []
             review_discovery: dict[str, tuple[str, str]] = {}
             variables = {"login": member.github_login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
             for _ in range(2):
                 contributions = client.connection(REVIEW_CONTRIBUTIONS_QUERY, variables, ("user", "contributionsCollection", "pullRequestReviewContributions"))
                 pr_ids: set[str] = set()
+                review_candidates: list[tuple[str, str]] = []
+                expected_in_window: set[str] = set()
                 for row in contributions:
                     if not isinstance(row.get("isRestricted"), bool):
                         raise RuntimeError("api_contract_violation")
@@ -716,7 +758,13 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if not isinstance(contributor, dict) or contributor.get("__typename") != "User" or contributor.get("id") != member.github_node_id or not isinstance(pull_request, dict) or not isinstance(pull_request.get("id"), str):
                         raise RuntimeError("api_contract_violation")
                     pr_ids.add(pull_request["id"])
-                discovery_data = client.graphql(REVIEW_PR_DISCOVERY_QUERY, {"ids": sorted(pr_ids)}) if pr_ids else {"nodes": []}
+                    contribution_at = row.get("occurredAt")
+                    if not isinstance(contribution_at, str):
+                        raise RuntimeError("api_contract_violation")
+                    if start.astimezone(UTC) <= parse_rfc3339(contribution_at) < end.astimezone(UTC):
+                        expected_in_window.add(pull_request["id"])
+                    review_candidates.append((pull_request["id"], contribution_at))
+                discovery_data = _query_nodes(client, REVIEW_PR_DISCOVERY_QUERY, sorted(pr_ids)) if pr_ids else {"nodes": []}
                 discovered = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
                 if not isinstance(discovered, list) or len(discovered) != len(pr_ids):
                     raise RuntimeError("visibility_unverified")
@@ -727,6 +775,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if node.get("__typename") != "PullRequest" or not isinstance(repo, dict) or repo.get("visibility") != "PUBLIC" or not isinstance(repo.get("id"), str) or not isinstance((repo.get("owner") or {}).get("id"), str):
                         raise RuntimeError("visibility_unverified")
                     review_discovery[pr_id] = (repo["id"], repo["owner"]["id"])
+                # Keep discovery evidence even for candidates later excluded
+                # by submittedAt; equal filtered results do not prove stability.
+                candidate_snapshots.append(tuple(sorted(
+                    (pr_id, timestamp, *review_discovery[pr_id])
+                    for pr_id, timestamp in review_candidates
+                )))
                 reps: list[tuple[str, dict[str, Any]]] = []
                 for pr_id in sorted(pr_ids):
                     reviews = client.connection(REVIEWS_QUERY, {"id": pr_id}, ("node", "reviews"))
@@ -749,16 +803,20 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         if start.astimezone(UTC) <= parsed < end.astimezone(UTC):
                             eligible_reviews.append({"id": review.get("id"), "submitted": submitted})
                     if not eligible_reviews:
+                        # Only discard boundary-adjacent discovery candidates
+                        # after fully reading the public PR's reviews connection.
+                        if pr_id not in expected_in_window:
+                            continue
                         raise RuntimeError("api_contract_violation")
                     reps.append((pr_id, min(eligible_reviews, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
                 digest = tuple(sorted((pr_id, str(review["id"]), review["submitted"]) for pr_id, review in reps))
                 review_snapshots.append(digest)
                 representative_rows = reps
-            if review_snapshots[0] != review_snapshots[1]:
+            if review_snapshots[0] != review_snapshots[1] or candidate_snapshots[0] != candidate_snapshots[1]:
                 raise RuntimeError("graphql_snapshot_unstable")
             review_snapshot_at = datetime.now(UTC).replace(microsecond=0)
             if representative_rows:
-                hydrated = client.graphql(HYDRATE_QUERY, {"ids": [pr_id for pr_id, _ in representative_rows]}).get("nodes")
+                hydrated = _query_nodes(client, HYDRATE_QUERY, [pr_id for pr_id, _ in representative_rows]).get("nodes")
                 by_id = _ordered_node_map(hydrated, [pr_id for pr_id, _ in representative_rows])
                 finished = datetime.now(UTC).replace(microsecond=0)
                 for pr_id, review in representative_rows:
@@ -837,7 +895,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             source_events = [event for event in events if event.member_id == member_id and event.source == source]
             try:
                 subject_ids = sorted({event.subject_node_id for event in source_events})
-                response = client.graphql(gate_discovery_query, {"ids": subject_ids})
+                response = _query_nodes(client, gate_discovery_query, subject_ids)
                 discovery_nodes = response.get("nodes") if isinstance(response, dict) else None
                 discovery = _ordered_node_map(discovery_nodes, subject_ids)
                 for event in source_events:
@@ -848,7 +906,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         raise RuntimeError("repository_binding_changed")
                 event_ids = sorted({event.event_node_id for event in source_events if event.event_node_id is not None and event.event_kind in {"issue_replied", "pr_reviewed"}})
                 if event_ids:
-                    response = client.graphql(gate_event_query, {"ids": event_ids})
+                    response = _query_nodes(client, gate_event_query, event_ids)
                     event_nodes = response.get("nodes") if isinstance(response, dict) else None
                     event_map = _ordered_node_map(event_nodes, event_ids)
                     for event in source_events:
@@ -859,7 +917,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         target_repo = target.get("repository") if isinstance(target, dict) else None
                         if not isinstance(target, dict) or target.get("id") != event.subject_node_id or not isinstance(target_repo, dict) or target_repo.get("id") != event.repo_node_id or target_repo.get("visibility") != "PUBLIC" or (target_repo.get("owner") or {}).get("id") != event.owner_node_id:
                             raise RuntimeError("repository_binding_changed")
-                response = client.graphql(gate_hydration_query, {"ids": subject_ids})
+                response = _query_nodes(client, gate_hydration_query, subject_ids)
                 hydration_nodes = response.get("nodes") if isinstance(response, dict) else None
                 hydration = _ordered_node_map(hydration_nodes, subject_ids)
                 for event in source_events:
