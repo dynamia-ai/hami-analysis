@@ -210,6 +210,14 @@ def test_search_attributed_bot_is_excluded_only_after_stable_public_discovery():
     assert not result.events
 
 
+@pytest.mark.parametrize('created', ['2026-07-01T23:59:59Z', '2026-07-02T00:00:03Z', None, 'invalid'])
+def test_bot_exclusion_cannot_hide_creation_time_conflicts(created):
+    result = run(QuarterlyGitHub(author_type='Bot', created=created))
+    row = status(result)
+    assert (row.status, row.reason) == ('failed', 'search_candidate_conflict')
+    assert not result.events
+
+
 @pytest.mark.parametrize('visibility', ['PRIVATE', 'INTERNAL'])
 def test_bot_does_not_bypass_visibility_gate(visibility):
     client = QuarterlyGitHub(author_type='Bot', visibility=visibility)
@@ -236,6 +244,52 @@ def test_outside_contribution_with_no_in_window_review_is_excluded_after_read():
     result = run(client)
     assert status(result, 'prs_reviewed').status == 'complete'
     assert client.review_reads == 2
+    assert not result.events
+
+
+@pytest.mark.parametrize('change', ['appears', 'disappears', 'replaced', 'timestamp'])
+@pytest.mark.parametrize('include_eligible', [False, True])
+def test_discarded_review_candidates_remain_part_of_snapshot_stability(change, include_eligible):
+    class ChangingCandidates(QuarterlyGitHub):
+        contribution_reads = 0
+
+        def connection(self, query, variables, path):
+            rows = super().connection(query, variables, path)
+            if query == REVIEW_CONTRIBUTIONS_QUERY:
+                self.contribution_reads += 1
+                if (change == 'appears' and self.contribution_reads == 1) or (change == 'disappears' and self.contribution_reads == 2):
+                    rows.pop()
+                elif self.contribution_reads == 2:
+                    if change == 'replaced':
+                        rows[-1]['pullRequest']['id'] = 'P2'
+                    elif change == 'timestamp':
+                        rows[-1]['occurredAt'] = '2026-06-30T02:00:00Z'
+            elif query == REVIEWS_QUERY and include_eligible and variables['id'] == 'P0':
+                rows[0]['submittedAt'] = '2026-07-02T00:00:00Z'
+            return rows
+
+    result = run(ChangingCandidates(count=2 if include_eligible else 1, review=True))
+    row = status(result, 'prs_reviewed')
+    assert (row.status, row.reason, row.snapshot_complete) == ('partial', 'graphql_snapshot_unstable', False)
+    assert not result.events
+
+
+def test_reordered_identical_discarded_candidates_are_stable():
+    class Reordered(QuarterlyGitHub):
+        contribution_reads = 0
+
+        def connection(self, query, variables, path):
+            rows = super().connection(query, variables, path)
+            if query == REVIEW_CONTRIBUTIONS_QUERY:
+                self.contribution_reads += 1
+                if self.contribution_reads == 2:
+                    rows.reverse()
+            return rows
+
+    client = Reordered(count=2, review=True)
+    result = run(client)
+    assert status(result, 'prs_reviewed').status == 'complete'
+    assert client.review_reads == 4
     assert not result.events
 
 

@@ -592,6 +592,15 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                             or node.get("mergedAt") != discovered_node.get("mergedAt")):
                         set_status(member.member_id, source, "failed", "graphql_snapshot_unstable")
                         continue
+                    try:
+                        rest_created = parse_rfc3339(candidate.created_at)
+                        graphql_created = parse_rfc3339(node["createdAt"])
+                    except (ValueError, KeyError, TypeError):
+                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
+                        continue
+                    if abs(graphql_created - rest_created) > timedelta(seconds=1):
+                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
+                        continue
                     # Search can attribute a Copilot-authored PR to the human
                     # requester. A stable, public Bot node is not authored work.
                     if (author.get("__typename") == "Bot" and isinstance(repo, dict)
@@ -620,15 +629,6 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         occurred = parse_rfc3339(raw_time)
                     except ValueError:
                         set_status(member.member_id, source, "failed", "api_contract_violation")
-                        continue
-                    try:
-                        rest_created = parse_rfc3339(candidate.created_at)
-                        graphql_created = parse_rfc3339(node["createdAt"])
-                    except (ValueError, KeyError, TypeError):
-                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
-                        continue
-                    if abs(graphql_created - rest_created) > timedelta(seconds=1):
-                        set_status(member.member_id, source, "failed", "search_candidate_conflict")
                         continue
                     if not (start.astimezone(UTC) <= occurred < end.astimezone(UTC)):
                         continue
@@ -739,12 +739,14 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         review_snapshot_at: datetime | None = None
         try:
             review_snapshots: list[tuple[tuple[str, str, str], ...]] = []
+            candidate_snapshots: list[tuple[tuple[str, str, str, str], ...]] = []
             representative_rows: list[tuple[str, dict[str, Any]]] = []
             review_discovery: dict[str, tuple[str, str]] = {}
             variables = {"login": member.github_login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
             for _ in range(2):
                 contributions = client.connection(REVIEW_CONTRIBUTIONS_QUERY, variables, ("user", "contributionsCollection", "pullRequestReviewContributions"))
                 pr_ids: set[str] = set()
+                review_candidates: list[tuple[str, str]] = []
                 expected_in_window: set[str] = set()
                 for row in contributions:
                     if not isinstance(row.get("isRestricted"), bool):
@@ -761,6 +763,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         raise RuntimeError("api_contract_violation")
                     if start.astimezone(UTC) <= parse_rfc3339(contribution_at) < end.astimezone(UTC):
                         expected_in_window.add(pull_request["id"])
+                    review_candidates.append((pull_request["id"], contribution_at))
                 discovery_data = _query_nodes(client, REVIEW_PR_DISCOVERY_QUERY, sorted(pr_ids)) if pr_ids else {"nodes": []}
                 discovered = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
                 if not isinstance(discovered, list) or len(discovered) != len(pr_ids):
@@ -772,6 +775,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if node.get("__typename") != "PullRequest" or not isinstance(repo, dict) or repo.get("visibility") != "PUBLIC" or not isinstance(repo.get("id"), str) or not isinstance((repo.get("owner") or {}).get("id"), str):
                         raise RuntimeError("visibility_unverified")
                     review_discovery[pr_id] = (repo["id"], repo["owner"]["id"])
+                # Keep discovery evidence even for candidates later excluded
+                # by submittedAt; equal filtered results do not prove stability.
+                candidate_snapshots.append(tuple(sorted(
+                    (pr_id, timestamp, *review_discovery[pr_id])
+                    for pr_id, timestamp in review_candidates
+                )))
                 reps: list[tuple[str, dict[str, Any]]] = []
                 for pr_id in sorted(pr_ids):
                     reviews = client.connection(REVIEWS_QUERY, {"id": pr_id}, ("node", "reviews"))
@@ -803,7 +812,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 digest = tuple(sorted((pr_id, str(review["id"]), review["submitted"]) for pr_id, review in reps))
                 review_snapshots.append(digest)
                 representative_rows = reps
-            if review_snapshots[0] != review_snapshots[1]:
+            if review_snapshots[0] != review_snapshots[1] or candidate_snapshots[0] != candidate_snapshots[1]:
                 raise RuntimeError("graphql_snapshot_unstable")
             review_snapshot_at = datetime.now(UTC).replace(microsecond=0)
             if representative_rows:
