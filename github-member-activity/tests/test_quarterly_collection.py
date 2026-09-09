@@ -250,6 +250,33 @@ def test_in_window_candidate_missing_eligible_review_still_fails():
     assert status(result, 'prs_reviewed').reason == 'api_contract_violation'
 
 
+@pytest.mark.parametrize('occurred_at', [None, 0, False, {}, [], '', 'not-a-timestamp'])
+def test_invalid_contribution_time_cannot_publish_an_eligible_review(occurred_at):
+    client = QuarterlyGitHub(review=True, contribution_at=occurred_at, submitted='2026-07-02T00:00:00Z')
+    result = run(client)
+    row = status(result, 'prs_reviewed')
+    assert (row.status, row.reason) == ('failed', 'api_contract_violation')
+    assert client.review_reads == 0
+    assert not result.events
+
+
+def test_missing_contribution_time_cannot_publish_an_eligible_review():
+    class MissingTime(QuarterlyGitHub):
+        def connection(self, query, variables, path):
+            rows = super().connection(query, variables, path)
+            if query == REVIEW_CONTRIBUTIONS_QUERY:
+                for row in rows:
+                    del row['occurredAt']
+            return rows
+
+    client = MissingTime(review=True, submitted='2026-07-02T00:00:00Z')
+    result = run(client)
+    row = status(result, 'prs_reviewed')
+    assert (row.status, row.reason) == ('failed', 'api_contract_violation')
+    assert client.review_reads == 0
+    assert not result.events
+
+
 def test_outside_candidate_cannot_hide_incomplete_reviews_connection():
     class Incomplete(QuarterlyGitHub):
         def connection(self, query, variables, path):

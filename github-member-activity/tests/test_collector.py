@@ -159,7 +159,7 @@ class ReviewSnapshotChangingGitHub(EmptyHydrationGitHub):
 
     def connection(self, query, variables, path):
         if path == ("user", "contributionsCollection", "pullRequestReviewContributions"):
-            return [{"isRestricted": False, "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
+            return [{"isRestricted": False, "occurredAt": "2026-01-02T00:00:00Z", "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
         if path == ("node", "reviews"):
             self.review_calls += 1
             self.current_submitted = "2026-01-02T00:00:00Z" if self.review_calls == 1 else "2026-01-03T00:00:00Z"
@@ -179,7 +179,7 @@ class ReviewLateVisibilityFailureGitHub(ReviewSnapshotChangingGitHub):
 
     def connection(self, query, variables, path):
         if path == ("user", "contributionsCollection", "pullRequestReviewContributions"):
-            return [{"isRestricted": False, "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
+            return [{"isRestricted": False, "occurredAt": "2026-01-02T00:00:00Z", "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
         if path == ("node", "reviews"):
             return [{"__typename": "PullRequestReview", "id": "RV1", "author": {"__typename": "User", "id": "U_1"}, "state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"}]
         return []
@@ -193,7 +193,7 @@ class ReviewLateVisibilityFailureGitHub(ReviewSnapshotChangingGitHub):
 class ReviewBotAndUserGitHub(EmptyGitHub):
     def connection(self, query, variables, path):
         if path == ("user", "contributionsCollection", "pullRequestReviewContributions"):
-            return [{"isRestricted": False, "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
+            return [{"isRestricted": False, "occurredAt": "2026-01-02T00:00:00Z", "user": {"__typename": "User", "id": "U_1"}, "pullRequest": {"id": "P1"}}]
         if path == ("node", "reviews"):
             return [
                 {"__typename": "PullRequestReview", "id": "BOT1", "author": {"__typename": "Bot", "id": "B1"}, "state": "APPROVED", "submittedAt": "2026-01-02T00:00:00Z"},

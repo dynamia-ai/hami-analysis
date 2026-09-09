@@ -757,7 +757,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         raise RuntimeError("api_contract_violation")
                     pr_ids.add(pull_request["id"])
                     contribution_at = row.get("occurredAt")
-                    if not isinstance(contribution_at, str) or start.astimezone(UTC) <= parse_rfc3339(contribution_at) < end.astimezone(UTC):
+                    if not isinstance(contribution_at, str):
+                        raise RuntimeError("api_contract_violation")
+                    if start.astimezone(UTC) <= parse_rfc3339(contribution_at) < end.astimezone(UTC):
                         expected_in_window.add(pull_request["id"])
                 discovery_data = _query_nodes(client, REVIEW_PR_DISCOVERY_QUERY, sorted(pr_ids)) if pr_ids else {"nodes": []}
                 discovered = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
