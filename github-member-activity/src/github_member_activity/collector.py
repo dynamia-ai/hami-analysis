@@ -367,7 +367,7 @@ query($login:String!, $from:DateTime!, $to:DateTime!, $after:String) {
 REVIEW_PR_DISCOVERY_QUERY = """
 query($ids:[ID!]!) { nodes(ids:$ids) {
   __typename id
-  ... on PullRequest { repository { id visibility owner { id } } }
+  ... on PullRequest { author { __typename ... on User { id } } repository { id visibility owner { id } } }
 } }
 """
 
@@ -734,16 +734,19 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
             proof = (True, None, True, False) if issue_snapshot_at is not None else (True, None, False, None) if reason == "graphql_snapshot_unstable" else None
             set_status(member.member_id, "issue_replies", "partial", reason, finished=issue_snapshot_at, proof_override=proof)
 
-        # Reviews use contribution nodes only to discover target PRs. The PR's
-        # complete reviews connection supplies the canonical submittedAt event.
+        # Reviews discover other-authored public PRs from contribution nodes and
+        # in-window conversation comments. The PR's reviews connection plus those
+        # comments supply the canonical event; one representative is kept per PR.
         review_snapshot_at: datetime | None = None
         try:
             review_snapshots: list[tuple[tuple[str, str, str], ...]] = []
             candidate_snapshots: list[tuple[tuple[str, str, str, str], ...]] = []
+            comment_snapshots: list[tuple[tuple[str, str, str], ...]] = []
             representative_rows: list[tuple[str, dict[str, Any]]] = []
             review_discovery: dict[str, tuple[str, str]] = {}
             variables = {"login": member.github_login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
             for _ in range(2):
+                review_discovery = {}
                 contributions = client.connection(REVIEW_CONTRIBUTIONS_QUERY, variables, ("user", "contributionsCollection", "pullRequestReviewContributions"))
                 pr_ids: set[str] = set()
                 review_candidates: list[tuple[str, str]] = []
@@ -764,6 +767,39 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     if start.astimezone(UTC) <= parse_rfc3339(contribution_at) < end.astimezone(UTC):
                         expected_in_window.add(pull_request["id"])
                     review_candidates.append((pull_request["id"], contribution_at))
+                comment_rows = client.connection(ISSUE_COMMENTS_QUERY, {"login": member.github_login}, ("user", "issueComments"))
+                eligible_pr_comments: list[dict[str, Any]] = []
+                for row in comment_rows:
+                    author = row.get("author")
+                    issue = row.get("issue")
+                    repo = row.get("repository")
+                    if row.get("__typename") != "IssueComment" or not isinstance(row.get("id"), str) or not row.get("id") or not isinstance(author, dict) or author.get("__typename") != "User" or author.get("id") != member.github_node_id or not isinstance(issue, dict) or not isinstance(issue.get("id"), str) or not issue.get("id") or not isinstance(repo, dict) or not isinstance(repo.get("id"), str) or not repo.get("id") or not isinstance((repo.get("owner") or {}).get("id"), str):
+                        raise RuntimeError("api_contract_violation")
+                    pull_request = row.get("pullRequest")
+                    if pull_request is None:
+                        continue
+                    if not isinstance(pull_request, dict) or not isinstance(pull_request.get("id"), str) or not pull_request["id"]:
+                        raise RuntimeError("api_contract_violation")
+                    created = row.get("createdAt")
+                    if not isinstance(created, str) or not (start.astimezone(UTC) <= parse_rfc3339(created) < end.astimezone(UTC)):
+                        continue
+                    eligible_pr_comments.append({"id": row["id"], "pr_id": pull_request["id"], "created": created})
+                comment_ids = list(dict.fromkeys(item["id"] for item in eligible_pr_comments))
+                discovered_comment_data = _query_nodes(client, ISSUE_COMMENT_DISCOVERY_QUERY, comment_ids) if comment_ids else {"nodes": []}
+                discovered_comments = discovered_comment_data.get("nodes") if isinstance(discovered_comment_data, dict) else None
+                if not isinstance(discovered_comments, list) or len(discovered_comments) != len(comment_ids):
+                    raise RuntimeError("visibility_unverified")
+                discovered_comments_by_id = _ordered_node_map(discovered_comments, comment_ids)
+                public_pr_comments: list[dict[str, Any]] = []
+                for item in eligible_pr_comments:
+                    comment = discovered_comments_by_id[item["id"]]
+                    comment_repo = comment.get("repository") if isinstance(comment, dict) else None
+                    comment_pr = comment.get("pullRequest") if isinstance(comment, dict) else None
+                    if not isinstance(comment, dict) or comment.get("__typename") != "IssueComment" or comment.get("createdAt") != item["created"] or not isinstance(comment.get("updatedAt"), str) or not isinstance(comment_pr, dict) or comment_pr.get("id") != item["pr_id"] or not isinstance(comment_repo, dict) or comment_repo.get("visibility") not in {"PUBLIC", "PRIVATE", "INTERNAL"}:
+                        raise RuntimeError("api_contract_violation")
+                    if comment_repo.get("visibility") == "PUBLIC":
+                        public_pr_comments.append(item)
+                        pr_ids.add(item["pr_id"])
                 discovery_data = _query_nodes(client, REVIEW_PR_DISCOVERY_QUERY, sorted(pr_ids)) if pr_ids else {"nodes": []}
                 discovered = discovery_data.get("nodes") if isinstance(discovery_data, dict) else None
                 if not isinstance(discovered, list) or len(discovered) != len(pr_ids):
@@ -781,15 +817,23 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     (pr_id, timestamp, *review_discovery[pr_id])
                     for pr_id, timestamp in review_candidates
                 )))
+                comment_snapshots.append(tuple(sorted((item["id"], item["pr_id"], item["created"]) for item in public_pr_comments)))
+                comments_by_pr: dict[str, list[dict[str, Any]]] = {}
+                for item in public_pr_comments:
+                    comments_by_pr.setdefault(item["pr_id"], []).append({"id": item["id"], "created": item["created"]})
                 reps: list[tuple[str, dict[str, Any]]] = []
                 for pr_id in sorted(pr_ids):
+                    node = discovered_by_id[pr_id]
+                    author = node.get("author") if isinstance(node, dict) else None
+                    if isinstance(author, dict) and author.get("__typename") == "User" and author.get("id") == member.github_node_id:
+                        continue
                     reviews = client.connection(REVIEWS_QUERY, {"id": pr_id}, ("node", "reviews"))
                     eligible_reviews: list[dict[str, Any]] = []
                     for review in reviews:
                         if not isinstance(review, dict) or review.get("__typename") != "PullRequestReview" or not isinstance(review.get("id"), str) or not review.get("id"):
                             raise RuntimeError("api_contract_violation")
-                        author = review.get("author")
-                        if not isinstance(author, dict) or author.get("__typename") != "User" or author.get("id") != member.github_node_id:
+                        review_author = review.get("author")
+                        if not isinstance(review_author, dict) or review_author.get("__typename") != "User" or review_author.get("id") != member.github_node_id:
                             continue
                         state = review.get("state")
                         submitted = review.get("submittedAt")
@@ -802,17 +846,20 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         parsed = parse_rfc3339(submitted)
                         if start.astimezone(UTC) <= parsed < end.astimezone(UTC):
                             eligible_reviews.append({"id": review.get("id"), "submitted": submitted})
-                    if not eligible_reviews:
+                    eligible_comments = comments_by_pr.get(pr_id, [])
+                    if not eligible_reviews and not eligible_comments:
                         # Only discard boundary-adjacent discovery candidates
                         # after fully reading the public PR's reviews connection.
                         if pr_id not in expected_in_window:
                             continue
                         raise RuntimeError("api_contract_violation")
-                    reps.append((pr_id, min(eligible_reviews, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
+                    interactions = [{"id": item["id"], "submitted": item["submitted"]} for item in eligible_reviews]
+                    interactions.extend({"id": item["id"], "submitted": item["created"]} for item in eligible_comments)
+                    reps.append((pr_id, min(interactions, key=lambda item: (parse_rfc3339(item["submitted"]), item["id"]))))
                 digest = tuple(sorted((pr_id, str(review["id"]), review["submitted"]) for pr_id, review in reps))
                 review_snapshots.append(digest)
                 representative_rows = reps
-            if review_snapshots[0] != review_snapshots[1] or candidate_snapshots[0] != candidate_snapshots[1]:
+            if review_snapshots[0] != review_snapshots[1] or candidate_snapshots[0] != candidate_snapshots[1] or comment_snapshots[0] != comment_snapshots[1]:
                 raise RuntimeError("graphql_snapshot_unstable")
             review_snapshot_at = datetime.now(UTC).replace(microsecond=0)
             if representative_rows:
@@ -822,6 +869,9 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                 for pr_id, review in representative_rows:
                     node = by_id.get(pr_id)
                     repo = node.get("repository") if isinstance(node, dict) else None
+                    author = node.get("author") if isinstance(node, dict) else None
+                    if isinstance(author, dict) and author.get("__typename") == "User" and author.get("id") == member.github_node_id:
+                        continue
                     if not isinstance(node, dict) or node.get("__typename") != "PullRequest" or not isinstance(repo, dict):
                         raise RuntimeError("visibility_unverified")
                     metadata = RepositoryMetadata(str(repo.get("id", "")), str(repo.get("nameWithOwner", "")), str((repo.get("owner") or {}).get("id", "")), str((repo.get("owner") or {}).get("login", "")), str(repo.get("visibility", "")))
@@ -886,7 +936,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         gate_event_query = """
         query($ids:[ID!]!) { nodes(ids:$ids) {
           __typename id
-          ... on IssueComment { issue { id repository { id visibility owner { id } } } }
+          ... on IssueComment { issue { id repository { id visibility owner { id } } } pullRequest { id repository { id visibility owner { id } } } }
           ... on PullRequestReview { pullRequest { id repository { id visibility owner { id } } } }
         } }
         """
@@ -913,7 +963,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         if event.event_node_id is None or event.event_kind not in {"issue_replied", "pr_reviewed"}:
                             continue
                         event_node = event_map.get(event.event_node_id)
-                        target = event_node.get("issue") if event.event_kind == "issue_replied" and isinstance(event_node, dict) and event_node.get("__typename") == "IssueComment" else event_node.get("pullRequest") if event.event_kind == "pr_reviewed" and isinstance(event_node, dict) and event_node.get("__typename") == "PullRequestReview" else None
+                        if event.event_kind == "issue_replied" and isinstance(event_node, dict) and event_node.get("__typename") == "IssueComment":
+                            target = event_node.get("issue")
+                        elif event.event_kind == "pr_reviewed" and isinstance(event_node, dict) and event_node.get("__typename") in {"PullRequestReview", "IssueComment"}:
+                            target = event_node.get("pullRequest")
+                        else:
+                            target = None
                         target_repo = target.get("repository") if isinstance(target, dict) else None
                         if not isinstance(target, dict) or target.get("id") != event.subject_node_id or not isinstance(target_repo, dict) or target_repo.get("id") != event.repo_node_id or target_repo.get("visibility") != "PUBLIC" or (target_repo.get("owner") or {}).get("id") != event.owner_node_id:
                             raise RuntimeError("repository_binding_changed")
