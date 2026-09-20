@@ -741,7 +741,7 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
         try:
             review_snapshots: list[tuple[tuple[str, str, str], ...]] = []
             candidate_snapshots: list[tuple[tuple[str, str, str, str], ...]] = []
-            comment_snapshots: list[tuple[tuple[str, str, str], ...]] = []
+            comment_snapshots: list[tuple[tuple[str, str, str, str, str], ...]] = []
             representative_rows: list[tuple[str, dict[str, Any]]] = []
             review_discovery: dict[str, tuple[str, str]] = {}
             variables = {"login": member.github_login, "from": format_z(start.astimezone(UTC)), "to": format_z(end.astimezone(UTC))}
@@ -817,7 +817,10 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                     (pr_id, timestamp, *review_discovery[pr_id])
                     for pr_id, timestamp in review_candidates
                 )))
-                comment_snapshots.append(tuple(sorted((item["id"], item["pr_id"], item["created"]) for item in public_pr_comments)))
+                comment_snapshots.append(tuple(sorted(
+                    (item["id"], item["pr_id"], item["created"], *review_discovery[item["pr_id"]])
+                    for item in public_pr_comments
+                )))
                 comments_by_pr: dict[str, list[dict[str, Any]]] = {}
                 for item in public_pr_comments:
                     comments_by_pr.setdefault(item["pr_id"], []).append({"id": item["id"], "created": item["created"]})
@@ -982,7 +985,12 @@ def collect(config: AppConfig, period: ReportPeriod, client: GitHubClient, *, ob
                         raise RuntimeError("repository_binding_changed")
                 for event in source_events:
                     metadata = RepositoryMetadata(event.repo_node_id, event.repo_full_name, event.owner_node_id, event.owner_login, "PUBLIC")
-                    if public_and_allowed(metadata, policy):
+                    member_login = next(
+                        member.github_login
+                        for member in config.members
+                        if member.member_id == event.member_id
+                    )
+                    if public_and_allowed(metadata, policy, member_login=member_login):
                         verified_events.append(event)
                     else:
                         if event.owner_node_id in policy.excluded_owner_ids:
