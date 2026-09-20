@@ -58,9 +58,10 @@ class QuarterlyGitHub:
     def node(self, key):
         if key.startswith("RV"):
             return {"__typename": "PullRequestReview", "id": key, "pullRequest": self.node(key[2:])}
+        author = {"__typename": "User", "id": "U_PR_AUTHOR"} if self.review else dict(self.author)
         return {
             "__typename": "PullRequest", "id": key, "number": int(key[1:]) + 1,
-            "author": dict(self.author), "createdAt": self.created, "mergedAt": None,
+            "author": author, "createdAt": self.created, "mergedAt": None,
             "repository": {"id": "R1", "nameWithOwner": "community/project", "visibility": self.visibility, "owner": {"id": "O1", "login": "community"}},
         }
 

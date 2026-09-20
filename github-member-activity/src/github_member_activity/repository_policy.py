@@ -14,11 +14,17 @@ class RepositoryMetadata:
     visibility: str
 
 
-def public_and_allowed(repo: RepositoryMetadata, policy: RepositoryPolicyConfig) -> bool:
+def public_and_allowed(
+    repo: RepositoryMetadata,
+    policy: RepositoryPolicyConfig,
+    *,
+    member_login: str | None = None,
+) -> bool:
     return (
         repo.visibility == "PUBLIC"
         and repo.node_id not in policy.excluded_repo_ids
         and repo.owner_node_id not in policy.excluded_owner_ids
+        and (member_login is None or repo.owner_login.lower() != member_login.lower())
     )
 
 

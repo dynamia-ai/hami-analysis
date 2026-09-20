@@ -223,6 +223,57 @@ class ReviewBotAndInvalidTargetGitHub(ReviewBotAndUserGitHub):
         return super().connection(query, variables, path)
 
 
+class ReviewFromPrCommentGitHub(EmptyGitHub):
+    def __init__(self, *, pr_author="U_OTHER", comment_id="C1", created="2026-01-02T00:00:00Z", extra_review=None):
+        self.pr_author = pr_author
+        self.comment_id = comment_id
+        self.created = created
+        self.extra_review = extra_review
+
+    def connection(self, query, variables, path):
+        if path == ("user", "issueComments"):
+            return [{
+                "__typename": "IssueComment", "id": self.comment_id,
+                "author": {"__typename": "User", "id": "U_1"},
+                "createdAt": self.created, "updatedAt": self.created,
+                "pullRequest": {"id": "P1"}, "issue": {"id": "I1"},
+                "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}},
+            }]
+        if path == ("node", "reviews") and self.extra_review is not None:
+            return [self.extra_review]
+        return []
+
+    def graphql(self, query, variables):
+        if "user(login" in query and "issueComments" not in query and "pullRequestReviewContributions" not in query:
+            return {"user": {"__typename": "User", "id": "U_1", "login": "Alice"}}
+        if "nodes(ids:$ids)" in query:
+            nodes = []
+            for key in variables["ids"]:
+                if key == self.comment_id:
+                    nodes.append({
+                        "__typename": "IssueComment", "id": key,
+                        "author": {"__typename": "User", "id": "U_1"},
+                        "createdAt": self.created, "updatedAt": self.created,
+                        "pullRequest": {"id": "P1", "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}},
+                        "issue": {"id": "I1", "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}},
+                        "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}},
+                    })
+                elif key.startswith("RV"):
+                    nodes.append({
+                        "__typename": "PullRequestReview", "id": key,
+                        "pullRequest": {"id": "P1", "repository": {"id": "R1", "visibility": "PUBLIC", "owner": {"id": "O1"}}},
+                    })
+                else:
+                    nodes.append({
+                        "__typename": "PullRequest", "id": key, "number": 7,
+                        "author": {"__typename": "User", "id": self.pr_author},
+                        "createdAt": "2026-01-01T00:00:00Z", "mergedAt": None,
+                        "repository": {"id": "R1", "nameWithOwner": "owner/repo", "visibility": "PUBLIC", "owner": {"id": "O1", "login": "owner"}},
+                    })
+            return {"nodes": nodes}
+        return super().graphql(query, variables)
+
+
 class CommitPartitionGitHub:
     def __init__(self, *, always_next=False, terminal_count=1):
         self.calls = []
@@ -511,6 +562,34 @@ def test_review_target_without_eligible_submitted_review_fails_explicitly(state,
     result = collect(config, period, ReviewBotAndInvalidTargetGitHub(state, submitted), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
     row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
     assert (row.status, row.reason) == ("failed", "api_contract_violation")
+
+
+def test_pr_conversation_comment_counts_as_review_not_issue_reply():
+    config, period = _proof_fixture()
+    result = collect(config, period, ReviewFromPrCommentGitHub(), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
+    assert row.status == "complete"
+    reviewed = [event for event in result.events if event.event_kind == "pr_reviewed"]
+    assert [(event.event_node_id, event.subject_node_id, event.occurred_at) for event in reviewed] == [("C1", "P1", "2026-01-02T00:00:00Z")]
+    assert [event for event in result.events if event.event_kind == "issue_replied"] == []
+
+
+def test_own_pr_conversation_comment_is_not_counted_as_review():
+    config, period = _proof_fixture()
+    result = collect(config, period, ReviewFromPrCommentGitHub(pr_author="U_1"), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    row = next(row for row in result.statuses if row.member_id == "alice" and row.source == "prs_reviewed")
+    assert row.status == "complete"
+    assert [event for event in result.events if event.event_kind == "pr_reviewed"] == []
+
+
+def test_review_and_conversation_comment_on_same_pr_count_once_at_earliest():
+    config, period = _proof_fixture()
+    later_review = {"__typename": "PullRequestReview", "id": "RV1", "author": {"__typename": "User", "id": "U_1"}, "state": "APPROVED", "submittedAt": "2026-01-03T00:00:00Z"}
+    earlier_review = {"__typename": "PullRequestReview", "id": "RV1", "author": {"__typename": "User", "id": "U_1"}, "state": "COMMENTED", "submittedAt": "2026-01-01T12:00:00Z"}
+    later = collect(config, period, ReviewFromPrCommentGitHub(extra_review=later_review), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    earlier = collect(config, period, ReviewFromPrCommentGitHub(extra_review=earlier_review), observed_at=datetime(2026, 1, 10, tzinfo=UTC))
+    assert [event.event_node_id for event in later.events if event.event_kind == "pr_reviewed"] == ["C1"]
+    assert [event.event_node_id for event in earlier.events if event.event_kind == "pr_reviewed"] == ["RV1"]
 
 
 def test_repository_gate_uses_repository_subject_directly():
